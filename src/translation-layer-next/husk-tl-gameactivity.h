@@ -12,6 +12,7 @@
 #define HUSK_TL_GAMEACTIVITY_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -50,6 +51,16 @@ bool tl_ga_is_ui_thread(void);
 
 /* Frames the game has presented. */
 unsigned long tl_ga_frames(void);
+
+/* The soft keyboard (GameTextInput): the game's field as it says it is, the keyboard shown or hidden, and what is typed. */
+void tl_ga_set_keyboard_handler(void (*hook)(int action));      /* 1 = show, 2 = hide */
+void tl_ga_text_state(const char *utf8, int sel_start, int sel_end);
+void tl_ga_keyboard(bool show);
+void tl_ga_ime_options(int ime_options);
+void tl_ga_insert_text(const char *utf8);
+void tl_ga_delete_backward(void);
+void tl_ga_editor_action(void);
+void tl_ga_text_copy(char *out, size_t cap);
 
 #ifdef __cplusplus
 }

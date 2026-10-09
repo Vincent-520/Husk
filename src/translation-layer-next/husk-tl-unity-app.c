@@ -22,8 +22,13 @@
 #include "husk-tl-internal.h"
 #include "husk-tl-jni.h"
 #include "husk-tl-ld.h"
+#include "husk-tl-godot.h"
 #include "husk-tl-unity.h"
 #include "husk-tl-audio.h"
+#include "husk-tl-geode.h"
+
+/* Geode for the next cocos2d-x launch: its release zip and its launcher's APK (husk-tl-geode.c). Empty: off. */
+static char g_geode_zip[1024], g_geode_launcher[1024];
 #include "husk-tl-cocos.h"
 #include "husk-tl-gameactivity.h"
 #include "husk-tl-gamepad.h"
@@ -35,7 +40,7 @@
 void tl_hle_set_ca_bundle(const char *path);
 extern int tl_log_sink_fd;
 
-enum { ENGINE_UNITY = 0, ENGINE_COCOS = 1, ENGINE_GAMEACTIVITY = 2, ENGINE_SDL = 3, ENGINE_UE4 = 4, ENGINE_GTA = 5 };
+enum { ENGINE_UNITY = 0, ENGINE_COCOS = 1, ENGINE_GAMEACTIVITY = 2, ENGINE_SDL = 3, ENGINE_UE4 = 4, ENGINE_GTA = 5, ENGINE_GODOT = 6 };
 
 static unsigned long engine_frames(void);
 
@@ -159,7 +164,7 @@ static void *heartbeat_thread(void *arg)
               tl_log_line("unity: a variadic shim's implementation (%s) changed callee-saved registers (%llu times; x21 then %#llx, diff mask %#llx)",
                           nm, (unsigned long long)seen, (unsigned long long)tl_va_clobber.x21, (unsigned long long)tl_va_clobber.mask);
           } }
-        if (A.engine == ENGINE_COCOS && tl_cocos_ended()) atomic_store(&A.state, HUSK_UNITY_ENDED);
+        if ((A.engine == ENGINE_COCOS && tl_cocos_ended()) || (A.engine == ENGINE_GODOT && tl_godot_ended())) atomic_store(&A.state, HUSK_UNITY_ENDED);
         if (atomic_load(&A.state) == HUSK_UNITY_ENDED || atomic_load(&A.state) == HUSK_UNITY_FAILED) return NULL;
     }
 }
@@ -256,9 +261,19 @@ static void *launch_thread(void *arg)
             return NULL;
         }
         for (int i = 0; i < A.nextra; i++) if (!tl_sdl_add_package(A.extra[i])) tl_log_line("sdl: cannot add %s", A.extra[i]);
-        tl_log_line("sdl: starting %s (%s) as %s, %dx%d", A.apk, activity, A.package, A.width, A.height);
+        /* SDL games may draw with Vulkan (SDL_WINDOW_VULKAN, or DXVK under a Direct3D port): MoltenVK, when the app named it */
+        if (A.vulkan[0]) tl_vk_configure(A.vulkan, NULL, 0);
+        tl_log_line("sdl: starting %s (%s) as %s, %dx%d (Vulkan: %s)", A.apk, activity, A.package, A.width, A.height, A.vulkan[0] ? "yes" : "no");
         tl_audio_install();
         ok = tl_sdl_start(&cfg, activity) && tl_sdl_run();
+    } else if (A.engine == ENGINE_GODOT) {
+        tl_godot_config cfg = {
+            .apk_path = A.apk, .data_dir = A.data, .package_name = A.package, .width = A.width, .height = A.height,
+            .metal_layer = A.layer, .angle_egl = A.angle, .angle_gles = NULL, .frame_dir = NULL, .frame_every = 0,
+        };
+        tl_log_line("godot: starting %s as %s, %dx%d", A.apk, A.package, A.width, A.height);
+        tl_audio_install();
+        ok = tl_godot_start(&cfg) && tl_godot_run();
     } else if (A.engine == ENGINE_GTA) {
         tl_ga_config cfg = {
             .apk_path = A.apk, .data_dir = A.data, .package_name = A.package, .width = A.width, .height = A.height,
@@ -284,6 +299,7 @@ static void *launch_thread(void *arg)
         tl_log_line("cocos: starting %s as %s, %dx%d", A.apk, A.package, A.width, A.height);
         tl_audio_install();
         tl_cocos_text_install();
+        if (g_geode_zip[0]) tl_geode_configure(g_geode_zip, g_geode_launcher, A.data, 0);
         ok = tl_cocos_start(&cfg) && tl_cocos_run();
     } else {
         tl_unity_config cfg = {
@@ -291,6 +307,7 @@ static void *launch_thread(void *arg)
             .metal_layer = A.layer, .angle_egl = A.angle, .angle_gles = NULL, .frame_dir = NULL, .frame_every = 0,
         };
         tl_log_line("unity: starting %s as %s, %dx%d", A.apk, A.package, A.width, A.height);
+        tl_audio_install();
         ok = tl_unity_start(&cfg) && tl_unity_run();
     }
     if (!ok) {
@@ -301,7 +318,13 @@ static void *launch_thread(void *arg)
     atomic_store(&A.state, HUSK_UNITY_RUNNING);
     pthread_t hb;
     if (pthread_create(&hb, NULL, heartbeat_thread, NULL) == 0) pthread_detach(hb);
-    return NULL;
+    /*
+     * This thread loaded the game's libraries and ran their JNI_OnLoad, which on Android is the UI thread, and that thread
+     * never ends. Some code relies on it: Geode 5 takes this thread as the game's main thread and keeps thread-local state
+     * on it, and ending the thread ran that state's cleanup, which freed what was not its to free and took Husk down
+     * (Geometry Dash 2.2081, a SIGTRAP from libmalloc right after the sound started). So it stays, asleep.
+     */
+    for (;;) pause();
 }
 
 static bool launch(int engine, const char *apk, const char *data_dir, void *metal_layer, int width, int height,
@@ -316,7 +339,7 @@ static bool launch(int engine, const char *apk, const char *data_dir, void *meta
     snprintf(A.angle, sizeof(A.angle), "%s", angle_dylib);
     snprintf(A.ca, sizeof(A.ca), "%s", ca_bundle ? ca_bundle : "");
     A.layer = metal_layer; A.width = width; A.height = height;
-    if (!husk_unity_package_name(apk, A.package, sizeof(A.package))) snprintf(A.package, sizeof(A.package), "%s", engine == ENGINE_GAMEACTIVITY ? "com.mojang.minecraftpe" : engine == ENGINE_GTA ? "com.rockstargames.gtasa" : engine == ENGINE_UE4 ? "com.epicgames.ue4" : engine == ENGINE_SDL ? "com.sdl.game" : engine == ENGINE_COCOS ? "com.cocos.game" : "com.unity.game");
+    if (!husk_unity_package_name(apk, A.package, sizeof(A.package))) snprintf(A.package, sizeof(A.package), "%s", engine == ENGINE_GAMEACTIVITY ? "com.mojang.minecraftpe" : engine == ENGINE_GTA ? "com.rockstargames.gtasa" : engine == ENGINE_UE4 ? "com.epicgames.ue4" : engine == ENGINE_SDL ? "com.sdl.game" : engine == ENGINE_COCOS ? "com.cocos.game" : engine == ENGINE_GODOT ? "com.godot.game" : "com.unity.game");
     pthread_attr_t at;
     pthread_attr_init(&at);
     pthread_attr_setstacksize(&at, 4u << 20);
@@ -332,6 +355,12 @@ bool husk_unity_launch(const char *apk, const char *data_dir, void *metal_layer,
                        const char *angle_dylib, const char *ca_bundle)
 {
     return launch(ENGINE_UNITY, apk, data_dir, metal_layer, width, height, angle_dylib, ca_bundle);
+}
+
+void husk_cocos_set_geode(const char *release_zip, const char *launcher_apk)
+{
+    snprintf(g_geode_zip, sizeof(g_geode_zip), "%s", release_zip ? release_zip : "");
+    snprintf(g_geode_launcher, sizeof(g_geode_launcher), "%s", launcher_apk ? launcher_apk : "");
 }
 
 bool husk_cocos_launch(const char *apk, const char *data_dir, void *metal_layer, int width, int height,
@@ -351,6 +380,11 @@ bool husk_sdl_launch(const char *apk, const char *data_dir, void *metal_layer, i
 {
     return launch(ENGINE_SDL, apk, data_dir, metal_layer, width, height, angle_dylib, ca_bundle);
 }
+bool husk_godot_launch(const char *apk, const char *data_dir, void *metal_layer, int width, int height,
+                       const char *angle_dylib, const char *ca_bundle)
+{
+    return launch(ENGINE_GODOT, apk, data_dir, metal_layer, width, height, angle_dylib, ca_bundle);
+}
 bool husk_gta_launch(const char *apk, const char *data_dir, void *metal_layer, int width, int height,
                      const char *angle_dylib, const char *ca_bundle)
 {
@@ -363,9 +397,15 @@ bool husk_ue4_launch(const char *apk, const char *data_dir, void *metal_layer, i
 }
 /* Where MoltenVK is: Unreal's Vulkan renderer runs on it. Before the launch call. */
 void husk_ue4_set_vulkan(const char *dylib) { snprintf(A.vulkan, sizeof(A.vulkan), "%s", dylib ? dylib : ""); }
+void tl_set_shared_storage(const char *dir);
+void husk_native_set_shared_storage(const char *dir) { tl_set_shared_storage(dir); }
+
 void husk_native_add_package(const char *apk)
 {
-    if (apk && A.nextra < 3 && atomic_load(&A.state) == HUSK_UNITY_IDLE) snprintf(A.extra[A.nextra++], sizeof(A.extra[0]), "%s", apk);
+    if (apk && A.nextra < 3 && atomic_load(&A.state) == HUSK_UNITY_IDLE) {
+        snprintf(A.extra[A.nextra++], sizeof(A.extra[0]), "%s", apk);
+        tl_ld_queue_split(apk);
+    }
 }
 void husk_sdl_set_safe_insets(int left, int top, int right, int bottom) { tl_sdl_set_safe_insets(left, top, right, bottom); }
 int husk_sdl_apk_is_portrait(const char *apk) { return tl_sdl_manifest_portrait(apk) ? 1 : 0; }
@@ -390,16 +430,30 @@ void husk_cocos_delete_backward(void) { if (atomic_load(&A.state) == HUSK_UNITY_
 void husk_cocos_key_down(int keycode) { if (atomic_load(&A.state) == HUSK_UNITY_RUNNING && A.engine == ENGINE_COCOS) tl_cocos_key_down(keycode); }
 void husk_cocos_request_text(void (*cb)(const char *utf8)) { if (atomic_load(&A.state) == HUSK_UNITY_RUNNING && A.engine == ENGINE_COCOS) tl_cocos_request_content_text(cb); }
 
+/* Minecraft and other GameActivity games: GameTextInput's field, typed into from the iPhone's keyboard. */
+void husk_ga_set_keyboard_handler(void (*handler)(int action)) { tl_ga_set_keyboard_handler(handler); }
+static bool ga_running(void) { return atomic_load(&A.state) == HUSK_UNITY_RUNNING && A.engine == ENGINE_GAMEACTIVITY; }
+void husk_ga_insert_text(const char *utf8) { if (ga_running()) tl_ga_insert_text(utf8); }
+void husk_ga_delete_backward(void) { if (ga_running()) tl_ga_delete_backward(); }
+void husk_ga_editor_action(void) { if (ga_running()) tl_ga_editor_action(); }
+void husk_ga_text(char *out, unsigned long cap) { if (cap) out[0] = 0; if (ga_running()) tl_ga_text_copy(out, cap); }
+
+/* A game that renders Direct3D through DXVK is a PC game ported over, and its menus answer a keyboard, mouse or controller, not touch. */
+bool husk_native_wants_controller(void)
+{
+    return tl_ld_find_lib("libdxvk_dxgi.so") || tl_ld_find_lib("libdxvk_d3d11.so") || tl_ld_find_lib("libdxvk_d3d9.so");
+}
+
 const char *husk_native_loaded_apk(void) { return atomic_load(&A.state) == HUSK_UNITY_IDLE ? NULL : A.apk; }
 
 int husk_unity_state(void)
 {
-    if (A.engine == ENGINE_COCOS && atomic_load(&A.state) == HUSK_UNITY_RUNNING && tl_cocos_ended()) atomic_store(&A.state, HUSK_UNITY_ENDED);
+    if (atomic_load(&A.state) == HUSK_UNITY_RUNNING && ((A.engine == ENGINE_COCOS && tl_cocos_ended()) || (A.engine == ENGINE_GODOT && tl_godot_ended()))) atomic_store(&A.state, HUSK_UNITY_ENDED);
     return atomic_load(&A.state);
 }
 static unsigned long engine_frames(void)
 {
-    return A.engine == ENGINE_GTA ? tl_gta_frames() : A.engine == ENGINE_UE4 ? tl_na_frames() : A.engine == ENGINE_SDL ? tl_sdl_frames() : A.engine == ENGINE_GAMEACTIVITY ? tl_ga_frames() : A.engine == ENGINE_COCOS ? tl_cocos_frames() : tl_unity_frames();
+    return A.engine == ENGINE_GODOT ? tl_godot_frames() : A.engine == ENGINE_GTA ? tl_gta_frames() : A.engine == ENGINE_UE4 ? tl_na_frames() : A.engine == ENGINE_SDL ? tl_sdl_frames() : A.engine == ENGINE_GAMEACTIVITY ? tl_ga_frames() : A.engine == ENGINE_COCOS ? tl_cocos_frames() : tl_unity_frames();
 }
 unsigned long husk_unity_frames(void) { return engine_frames(); }
 void husk_unity_perf_snapshot(husk_unity_perf *out)
@@ -416,12 +470,14 @@ void husk_unity_perf_snapshot(husk_unity_perf *out)
         return;
     }
     if (A.engine == ENGINE_COCOS) { tl_cocos_perf p; tl_cocos_perf_snapshot(&p); out->fps = p.fps; out->mean_ms = p.mean_ms; out->max_ms = p.max_ms; return; }
+    if (A.engine == ENGINE_GODOT) { tl_godot_perf p; tl_godot_perf_snapshot(&p); out->fps = p.fps; out->mean_ms = p.mean_ms; out->max_ms = p.max_ms; return; }
     tl_unity_perf p; tl_unity_perf_snapshot(&p); out->fps = p.fps; out->mean_ms = p.mean_ms; out->max_ms = p.max_ms;
 }
 void husk_unity_touch(int phase, int id, float x, float y)
 {
     if (atomic_load(&A.state) != HUSK_UNITY_RUNNING) return;
-    if (A.engine == ENGINE_GTA) tl_gta_touch(phase, id, x, y);
+    if (A.engine == ENGINE_GODOT) tl_godot_touch(phase, id, x, y);
+    else if (A.engine == ENGINE_GTA) tl_gta_touch(phase, id, x, y);
     else if (A.engine == ENGINE_UE4) tl_na_touch(phase, id, x, y);
     else if (A.engine == ENGINE_SDL) tl_sdl_touch(phase, id, x, y);
     else if (A.engine == ENGINE_GAMEACTIVITY) tl_ga_touch(phase, id, x, y);
@@ -430,11 +486,13 @@ void husk_unity_touch(int phase, int id, float x, float y)
 void husk_unity_set_paused(bool paused)
 {
     if (atomic_load(&A.state) != HUSK_UNITY_RUNNING) return;
-    if (A.engine == ENGINE_GTA) { tl_gta_set_paused(paused); tl_audio_set_paused(paused); }
+    if (A.engine == ENGINE_GODOT) { tl_godot_set_paused(paused); tl_audio_set_paused(paused); }
+    else if (A.engine == ENGINE_GTA) { tl_gta_set_paused(paused); tl_audio_set_paused(paused); }
     else if (A.engine == ENGINE_UE4) { tl_na_set_paused(paused); tl_audio_set_paused(paused); }
     else if (A.engine == ENGINE_SDL) { tl_sdl_set_paused(paused); tl_audio_set_paused(paused); }
     else if (A.engine == ENGINE_GAMEACTIVITY) { tl_ga_set_paused(paused); tl_audio_set_paused(paused); }
-    else if (A.engine == ENGINE_COCOS) { tl_cocos_set_paused(paused); tl_audio_set_paused(paused); } else tl_unity_set_paused(paused);
+    else if (A.engine == ENGINE_COCOS) { tl_cocos_set_paused(paused); tl_audio_set_paused(paused); }
+    else { tl_unity_set_paused(paused); tl_audio_set_paused(paused); }
 }
 
 /* ------------------------------------------------------------- package name */

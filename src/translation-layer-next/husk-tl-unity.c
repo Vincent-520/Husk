@@ -114,6 +114,14 @@ static void *unity_main(void *arg)
     NATIVE_VOID("nativeResume", "()V", 0, 0);
     tl_log_line("unity: nativeResume done");
     NATIVE_VOID("nativeFocusChanged", "(Z)V", 1, 0);
+    /* What Unity's Java side tells the engine as it starts on a phone: the media volume (AudioVolumeHandler reports it, and
+     * an engine that never hears it takes the device as muted) and that its sound is not muted. */
+    {
+        jobj *volume = tl_jni_new_object(tl_jni_class("com/unity3d/player/AudioVolumeHandler"));
+        call_native_on("com/unity3d/player/AudioVolumeHandler", volume, "onAudioVolumeChanged", "(I)V", 7, 0);
+        NATIVE_VOID("nativeMuteMasterAudio", "(Z)V", 0, 0);
+        tl_log_line("unity: told the engine the volume (7 of 15) and that sound is on");
+    }
 
     void *render = native_of("com/unity3d/player/UnityPlayer", "nativeRender", "()Z");
     bool was_paused = false;

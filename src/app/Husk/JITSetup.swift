@@ -160,8 +160,27 @@ final class JITCoordinator: ObservableObject {
 
     /// Get a debugger attached with whichever method applies, or open the setup
     /// walkthrough when that method is not set up yet.
+    /// "Turn on JIT at launch": when Husk opens without JIT, ask the built-in StikJIT for it straight away, once per launch.
+    /// Only when StikJIT can do it unattended -- it is available here and already paired -- so opening Husk never lands in
+    /// the setup walkthrough by surprise.
+    static let autoEnableKey = "husk.jit.autoEnable"
+    private var autoTried = false
+
+    func enableAtLaunchIfAsked() {
+        guard !autoTried, UserDefaults.standard.bool(forKey: Self.autoEnableKey) else { return }
+        autoTried = true
+        guard !JITBootstrap.ready else { return }
+        guard HuskBuiltInJIT.isAvailable, hasPairing else {
+            log("JIT at launch is on, but built-in StikJIT is not available or not paired; skipped")
+            return
+        }
+        log("turning JIT on at launch with built-in StikJIT")
+        method = .builtIn
+        enable()
+    }
+
     func enable() {
-        guard !JITBootstrap.isDebuggerAttached else { return }
+        guard !JITBootstrap.ready else { return }
         error = nil
         connectionProblem = nil
         switch resolvedMethod {

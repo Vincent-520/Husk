@@ -70,10 +70,15 @@ enum JITBootstrap {
     /// not work. So claim it first and hold it.
     @discardableResult
     static func prewarm() -> Bool {
-        guard isDebuggerAttached else {
+        if prewarmed { return true }
+        // Before iOS 26 Husk can make the region itself where the device allows it (TrollStore's dynamic-codesigning, a
+        // jailbreak, or a debugger that attached and let go), so it does not wait for CS_DEBUGGED there: Dopamine hides that
+        // flag from apps unless "Allow JIT in Apps" is on, while still letting them run code they wrote.
+        guard isDebuggerAttached || (canGrantOwnJIT && !selfGrantTried) else {
             HuskLog.log("jit", "no debugger attached yet; not prewarming")
             return false
         }
+        if !isDebuggerAttached { selfGrantTried = true }
         HuskLog.log("jit", "claiming \(jitBytes / (1024 * 1024)) MiB of JIT memory now, "
                          + "before the guest download -- StikDebug does not stay attached")
         let ok = husk_ios_jit_prewarm(jitBytes)
@@ -113,6 +118,17 @@ enum JITBootstrap {
     static var keepDebuggerAttached: Bool {
         get { UserDefaults.standard.bool(forKey: "husk.keepDebuggerAttached") }
         set { UserDefaults.standard.set(newValue, forKey: "husk.keepDebuggerAttached") }
+    }
+
+    /// The one try at making the region without a debugger has been made (it is not repeated: the answer will not change).
+    nonisolated(unsafe) static private var selfGrantTried = false
+
+    /// Whether Husk has JIT now: a debugger marked it, or the region is already held. Before iOS 26 this tries, once, to make
+    /// the region itself, which is all TrollStore and jailbroken devices need. Cheap after the first call, and logs nothing.
+    static var ready: Bool {
+        if debuggedFlag || prewarmed || isLive { return true }
+        guard canGrantOwnJIT, !selfGrantTried else { return false }
+        return prewarm()
     }
 
     /// True once this process has told StikDebug to let go.

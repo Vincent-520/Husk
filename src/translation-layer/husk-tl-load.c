@@ -25,6 +25,7 @@
  * because the point of the attempt is to find where the wall is.
  */
 #define _GNU_SOURCE
+#include "husk-tl-sound.h"
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -2016,6 +2017,7 @@ void husk_tl_attempt_reset(void)
 void husk_tl_attempt_stop(void)
 {
     tl_loader_request_stop();
+    tl_sound_stop_all();
 }
 
 void husk_tl_send_touch(int action, float x, float y)

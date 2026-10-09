@@ -9,7 +9,11 @@
  */
 #define _DARWIN_C_SOURCE
 #include "husk-tl-bionic.h"
+#include "husk-tl-internal.h"
+#include "husk-tl-codewrite.h"
+#include "husk-tl-xmem.h"
 
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <stdbool.h>
@@ -123,6 +127,9 @@ int tl_synth_open(const char *path)
     return s ? synth_file(s) : -1;
 }
 
+static char g_shared_storage[1024];
+void tl_set_shared_storage(const char *dir) { snprintf(g_shared_storage, sizeof(g_shared_storage), "%s", dir ? dir : ""); }
+
 const char *tl_path_resolve(const char *path, char *buf, size_t n)
 {
     if (!path) return path;
@@ -139,6 +146,16 @@ const char *tl_path_resolve(const char *path, char *buf, size_t n)
     }
     if (!strncmp(path, "/sdcard", 7) || !strncmp(path, "/storage/emulated/0", 19)) {
         const char *rest = !strncmp(path, "/sdcard", 7) ? path + 7 : path + 19;
+        /* Shared storage (anything but an app's own Android/data and Android/obb) is one folder for every game when the app gave one,
+         * which the player can fill from Files: a game whose data lives in a folder of its own on /sdcard finds it there. What a game
+         * already keeps in its private copy stays found. */
+        if (g_shared_storage[0] && strncmp(rest, "/Android/data", 13) && strncmp(rest, "/Android/obb", 12)) {
+            char own[1024]; struct stat st;
+            snprintf(own, sizeof(own), "%s/sdcard%s", tl_data_dir(), rest);
+            if (rest[0] && rest[1] && stat(own, &st) == 0) { snprintf(buf, n, "%s", own); return buf; }
+            snprintf(buf, n, "%s%s", g_shared_storage, rest);
+            return buf;
+        }
         snprintf(buf, n, "%s/sdcard%s", tl_data_dir(), rest);
         return buf;
     }
@@ -176,6 +193,97 @@ static const vfile *vfile_find(const char *path)
     return NULL;
 }
 static bool vfd_is(int fd) { return fd >= 0 && fd < 4096 && g_vfd[fd].on; }
+
+static void ftrace_open_jar(const char *path, int fd)
+{
+    static int tr = -1;
+    if (tr < 0) tr = getenv("TL_FILE_TRACE") ? atoi(getenv("TL_FILE_TRACE")) : 0;
+    if (tr) tl_log_line("file: open(%s) -> %d (inside the APK)", path, fd);
+}
+
+/* ------------------------------------------------------------ files inside an APK */
+
+/*
+ * "jar:file:///data/app/.../base.apk!/assets/aa/Android/catalog.json": how Java's JarURLConnection, and Unity's Addressables
+ * after it, name a file inside the APK. On a phone the platform reads those; here the guest hands such a path straight to
+ * stat() and open(), sometimes with its current directory glued in front. So: a stored entry is served in place, as a stretch
+ * of the APK (the virtual-file machinery above), and a compressed one is inflated once into the data folder and opened from
+ * there. Subway Surfers keeps its whole Addressables catalogue -- its sounds among it -- behind paths like these.
+ */
+typedef struct { bool found, dir; char apk[1024]; uint64_t off, size; uint16_t method; char entry[512]; } jar_entry;
+static pthread_mutex_t g_jar_lock = PTHREAD_MUTEX_INITIALIZER;
+static tl_zip g_jar_zip;
+static char g_jar_apk[1024];
+
+static bool jar_lookup(const char *p, jar_entry *out)
+{
+    memset(out, 0, sizeof(*out));
+    const char *q = p ? strstr(p, "jar:file:") : NULL;
+    if (!q) return false;
+    q += 9;
+    while (q[0] == '/' && q[1] == '/') q++;
+    const char *bang = strstr(q, "!/");
+    if (!bang || (size_t)(bang - q) >= sizeof(out->apk)) return true;          /* a jar path, but not one that names an entry */
+    size_t n = 0;
+    for (const char *c = q; c < bang && n + 1 < sizeof(out->apk); c++) {        /* percent-decoding, as a URL needs */
+        if (c[0] == '%' && c + 2 < bang && isxdigit((unsigned char)c[1]) && isxdigit((unsigned char)c[2])) {
+            char hex[3] = { c[1], c[2], 0 }; out->apk[n++] = (char)strtol(hex, NULL, 16); c += 2;
+        } else out->apk[n++] = *c;
+    }
+    out->apk[n] = 0;
+    snprintf(out->entry, sizeof(out->entry), "%s", bang + 2);
+    pthread_mutex_lock(&g_jar_lock);
+    if (strcmp(g_jar_apk, out->apk) != 0) {
+        if (g_jar_apk[0]) tl_zip_close(&g_jar_zip);
+        g_jar_apk[0] = 0;
+        char err[160];
+        if (tl_zip_open(&g_jar_zip, out->apk, err, sizeof(err))) snprintf(g_jar_apk, sizeof(g_jar_apk), "%s", out->apk);
+    }
+    const tl_zip_entry *e = g_jar_apk[0] ? tl_zip_find(&g_jar_zip, out->entry) : NULL;
+    if (e && e->local_offset + 30 <= g_jar_zip.size) {
+        const uint8_t *l = g_jar_zip.map + e->local_offset;
+        uint64_t data = e->local_offset + 30ull + (uint64_t)(l[26] | (l[27] << 8)) + (uint64_t)(l[28] | (l[29] << 8));
+        out->found = true; out->off = data; out->size = e->usize; out->method = e->method;
+    } else if (g_jar_apk[0]) {
+        /* No entry by that name: a folder, if any entry lies under it (zips seldom list folders themselves). */
+        size_t len = strlen(out->entry);
+        while (len && out->entry[len - 1] == '/') out->entry[--len] = 0;
+        for (size_t i = 0; len && i < g_jar_zip.count; i++) {
+            const char *name = g_jar_zip.entries[i].name;
+            if (!strncmp(name, out->entry, len) && name[len] == '/') { out->found = out->dir = true; break; }
+        }
+    }
+    pthread_mutex_unlock(&g_jar_lock);
+    return true;
+}
+
+/* A compressed entry, inflated once into <data>/.jar-cache: the path to open instead, or NULL. */
+static const char *jar_inflated(const jar_entry *j, char *buf, size_t n)
+{
+    char name[512]; size_t k = 0;
+    for (const char *c = j->entry; *c && k + 1 < sizeof(name); c++) name[k++] = (*c == '/') ? '_' : *c;
+    name[k] = 0;
+    char dir[1100];
+    snprintf(dir, sizeof(dir), "%s/.jar-cache", tl_data_dir());
+    mkdir(dir, 0755);
+    snprintf(buf, n, "%s/%s", dir, name);
+    struct stat st;
+    if (stat(buf, &st) == 0 && (uint64_t)st.st_size == j->size) return buf;
+    pthread_mutex_lock(&g_jar_lock);
+    const tl_zip_entry *e = tl_zip_find(&g_jar_zip, j->entry);
+    const uint8_t *data = NULL; size_t len = 0; bool owned = false; char err[160];
+    bool ok = e && tl_zip_data(&g_jar_zip, e, 1u << 30, &data, &len, &owned, err, sizeof(err));
+    pthread_mutex_unlock(&g_jar_lock);
+    if (!ok) return NULL;
+    char tmp[1200];
+    snprintf(tmp, sizeof(tmp), "%s.part", buf);
+    FILE *f = fopen(tmp, "wb");
+    bool wrote = f && fwrite(data, 1, len, f) == len;
+    if (f) fclose(f);
+    if (owned) free((void *)data);
+    if (!wrote || rename(tmp, buf) != 0) { unlink(tmp); return NULL; }
+    return buf;
+}
 
 /* ----------------------------------------------------------- open & friends */
 
@@ -269,6 +377,21 @@ void tl_atomic_closed(int fd)
 static int b_open(const char *path, int flags, unsigned mode)
 {
     char buf[1024], content[8192];
+    jar_entry jar;
+    if (jar_lookup(path, &jar)) {
+        if (!jar.found || jar.dir || (flags & 3) != 0) { tl_set_guest_errno(jar.dir ? 21 : 2); ftrace_open_jar(path, -1); return -1; }
+        int fd;
+        if (jar.method == 0) {
+            TL_ERRNO_BEGIN(); fd = open(jar.apk, O_RDONLY); TL_ERRNO_END();
+            if (fd >= 0 && fd < 4096) g_vfd[fd] = (vfd){ true, jar.off, jar.size, 0 };
+        } else {
+            char inflated[1200];
+            const char *real = jar_inflated(&jar, inflated, sizeof(inflated));
+            TL_ERRNO_BEGIN(); fd = real ? open(real, O_RDONLY) : -1; TL_ERRNO_END();
+        }
+        ftrace_open_jar(path, fd);
+        return fd;
+    }
     const char *real = tl_path_resolve(path, buf, sizeof(buf));
     const char *s = synth_content(path, content, sizeof(content));
     if (s) {
@@ -332,6 +455,8 @@ static long b_write(int fd, const void *p, size_t n)
     if (net_trace_fd(fd)) tl_log_line("net: write(fd %d, %zu) -> %ld errno %d", fd, n, r, r < 0 ? e : 0);
     return r;
 }
+/* write() with the buffer's size checked first, as bionic's FORTIFY does */
+static long b___write_chk(int fd, const void *p, size_t n, size_t bufsize) { if (n > bufsize) abort(); return b_write(fd, p, n); }
 static long b_writev(int fd, const struct iovec *v, int n) { TL_ERRNO_BEGIN(); long r = writev(fd, v, n); TL_ERRNO_END(); return r; }
 static long b_pread64(int fd, void *p, size_t n, long off)
 {
@@ -388,12 +513,23 @@ static void ftrace(const char *what, const char *path, int r, int e)
     if (tr < 0) tr = getenv("TL_FILE_TRACE") ? atoi(getenv("TL_FILE_TRACE")) : 0;
     if (tr) tl_log_line("file: %s(%s) -> %d%s", what, path ? path : "(null)", r, r < 0 ? (e == ENOENT ? " ENOENT" : " error") : "");
 }
-static int b_access(const char *p, int m) { char b[1024]; if (vfile_find(p)) { if (m & 2) { tl_set_guest_errno(13); return -1; } return 0; } TL_ERRNO_BEGIN(); int r = access(tl_path_resolve(p, b, sizeof(b)), m); int e = errno; TL_ERRNO_END(); ftrace("access", p, r, e); return r; }
+static int b_access(const char *p, int m) { char b[1024]; jar_entry jar; if (jar_lookup(p, &jar)) { if (!jar.found) { tl_set_guest_errno(2); return -1; } if (m & 2) { tl_set_guest_errno(13); return -1; } return 0; } if (vfile_find(p)) { if (m & 2) { tl_set_guest_errno(13); return -1; } return 0; } TL_ERRNO_BEGIN(); int r = access(tl_path_resolve(p, b, sizeof(b)), m); int e = errno; TL_ERRNO_END(); ftrace("access", p, r, e); return r; }
 static int b_chmod(const char *p, unsigned m) { char b[1024]; TL_ERRNO_BEGIN(); int r = chmod(tl_path_resolve(p, b, sizeof(b)), (mode_t)m); TL_ERRNO_END(); return r; }
 static int b_fchmod(int fd, unsigned m) { TL_ERRNO_BEGIN(); int r = fchmod(fd, (mode_t)m); TL_ERRNO_END(); return r; }
 static int b_link(const char *a, const char *b2) { char x[1024], y[1024]; TL_ERRNO_BEGIN(); int r = link(tl_path_resolve(a, x, sizeof(x)), tl_path_resolve(b2, y, sizeof(y))); TL_ERRNO_END(); return r; }
 static int b_symlink(const char *a, const char *b2) { char y[1024]; TL_ERRNO_BEGIN(); int r = symlink(a, tl_path_resolve(b2, y, sizeof(y))); TL_ERRNO_END(); return r; }
-static long b_readlink(const char *p, char *buf, size_t n) { char b[1024]; TL_ERRNO_BEGIN(); long r = readlink(tl_path_resolve(p, b, sizeof(b)), buf, n); TL_ERRNO_END(); return r; }
+static long b_readlink(const char *p, char *buf, size_t n)
+{
+    /* An Android app's executable is the zygote's app_process. The host has no /proc, and code that sizes a string with the result (DXVK's
+     * exe-name lookup) throws when it gets -1. */
+    if (p && (!strcmp(p, "/proc/self/exe") || !strncmp(p, "/proc/", 6) && strstr(p, "/exe") && strlen(strstr(p, "/exe")) == 4)) {
+        static const char exe[] = "/system/bin/app_process64";
+        size_t l = strlen(exe) < n ? strlen(exe) : n;
+        memcpy(buf, exe, l);
+        return (long)l;
+    }
+    char b[1024]; TL_ERRNO_BEGIN(); long r = readlink(tl_path_resolve(p, b, sizeof(b)), buf, n); TL_ERRNO_END(); return r;
+}
 static char *b_realpath(const char *p, char *out) { char b[1024]; TL_ERRNO_BEGIN(); char *r = realpath(tl_path_resolve(p, b, sizeof(b)), out); TL_ERRNO_END(); return r; }
 static char *b_getcwd(char *buf, size_t n) { TL_ERRNO_BEGIN(); char *r = getcwd(buf, n); TL_ERRNO_END(); return r; }
 static int b_utimes(const char *p, const struct timeval tv[2]) { char b[1024]; TL_ERRNO_BEGIN(); int r = utimes(tl_path_resolve(p, b, sizeof(b)), tv); TL_ERRNO_END(); return r; }
@@ -441,6 +577,15 @@ static int b_stat(const char *p, guest_stat *g)
 {
     char b[1024], c[8192]; struct stat s;
     if (synth_content(p, c, sizeof(c))) { memset(g, 0, sizeof(*g)); g->st_mode = S_IFREG | 0444; g->st_nlink = 1; return 0; }
+    jar_entry jar;
+    if (jar_lookup(p, &jar)) {
+        ftrace("stat", p, jar.found ? 0 : -1, jar.found ? 0 : ENOENT);
+        if (!jar.found || stat(jar.apk, &s) != 0) { tl_set_guest_errno(2); return -1; }
+        fill_stat(g, &s);
+        if (jar.dir) { g->st_mode = S_IFDIR | 0555; g->st_size = 4096; g->st_blocks = 8; }
+        else { g->st_size = (int64_t)jar.size; g->st_mode = S_IFREG | 0444; g->st_blocks = (int64_t)((jar.size + 511) / 512); }
+        return 0;
+    }
     const vfile *vf = vfile_find(p);
     if (vf) {
         TL_ERRNO_BEGIN(); int vr = stat(vf->host, &s); int ve = errno; TL_ERRNO_END();
@@ -456,6 +601,7 @@ static int b_stat(const char *p, guest_stat *g)
 static int b_lstat(const char *p, guest_stat *g)
 {
     char b[1024]; struct stat s;
+    if (p && strstr(p, "jar:file:")) return b_stat(p, g);
     TL_ERRNO_BEGIN(); int r = lstat(tl_path_resolve(p, b, sizeof(b)), &s); TL_ERRNO_END();
     if (r == 0) fill_stat(g, &s);
     return r;
@@ -711,6 +857,16 @@ static size_t phantom_clamp(uintptr_t a, size_t l)
 
 static void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, long off)
 {
+    /* A hooking library's trampolines (Geode): executable memory is a piece of the JIT region, written through the other view. */
+    if ((prot & PROT_EXEC) && (flags & 0x20) && !(flags & 0x10) && tl_codewrite_enabled()) {
+        uint8_t *rx, *rw;
+        size_t n = (len + TL_XMEM_PAGE - 1) & ~(size_t)(TL_XMEM_PAGE - 1);
+        if (tl_xmem_alloc(n, &rx, &rw)) {
+            memset(rw, 0, n);
+            tl_log_line("mm: %#zx bytes of executable memory for the guest at %p", n, (void *)rx);
+            return rx;
+        }
+    }
     int df = flags & 0x3;                                   /* MAP_SHARED / MAP_PRIVATE */
     if (flags & 0x10)   df |= MAP_FIXED;
     if (flags & 0x20)   df |= MAP_ANON;
@@ -732,6 +888,7 @@ static void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, long of
 }
 static int b_munmap(void *a, size_t l)
 {
+    if (tl_xmem_contains(a)) return 0;                       /* JIT memory handed out above: kept, as the region only grows */
     size_t real = phantom_clamp((uintptr_t)a, l);
     if (real == 0) return 0;                                 /* the half of a phantom range that was never mapped */
     TL_ERRNO_BEGIN(); int r = munmap(a, real); TL_ERRNO_END(); mm_trace("munmap", a, real, r, errno); return r;
@@ -750,6 +907,9 @@ static bool anon_contains(uintptr_t addr, size_t len)
  * pretending to succeed would have it jump into data. */
 static int b_mprotect(void *a, size_t l, int prot)
 {
+    /* Code a hooking library is about to patch: its permissions stay as they are, and its stores are carried out through
+     * the writable view as they fault (husk-tl-codewrite.c). */
+    if (tl_codewrite_enabled() && tl_xmem_contains(a)) { mm_trace("mprotect", a, l, prot, 0); return 0; }
     if ((prot & PROT_EXEC) && anon_contains((uintptr_t)a, l)) {
         tl_note_once("mprotect asked to make the guest's own memory executable: refused");
         tl_set_guest_errno(13);                                                                                            /* EACCES */
@@ -1104,7 +1264,7 @@ static int b_inotify_add_watch(int a, const char *b, unsigned c) { (void)a; (voi
 
 const tl_bionic_entry tl_tab_io[] = {
     TL_WRAP("open", b_open), TL_WRAP("__open_2", b___open_2), TL_WRAP("close", b_close), TL_WRAP("read", b_read),
-    TL_WRAP("__read_chk", b___read_chk), TL_WRAP("write", b_write), TL_WRAP("writev", b_writev),
+    TL_WRAP("__read_chk", b___read_chk), TL_WRAP("write", b_write), TL_WRAP("__write_chk", b___write_chk), TL_WRAP("writev", b_writev),
     TL_WRAP("pread64", b_pread64), TL_WRAP("pwrite64", b_pwrite64), TL_WRAP("__pread64_chk", b___pread64_chk), TL_WRAP("__pwrite64_chk", b___pwrite64_chk), TL_WRAP("__pwrite_chk", b___pwrite64_chk), TL_WRAP("__pread_chk", b___pread64_chk), TL_WRAP("lseek", b_lseek), TL_WRAP("lseek64", b_lseek),
     TL_WRAP("dup", b_dup), TL_WRAP("dup2", b_dup2), TL_WRAP("pipe", b_pipe), TL_WRAP("fsync", b_fsync), TL_WRAP("fdatasync", b_fsync),
     TL_WRAP("ftruncate", b_ftruncate), TL_WRAP("truncate", b_truncate), TL_WRAP("isatty", b_isatty), TL_WRAP("flock", b_flock),

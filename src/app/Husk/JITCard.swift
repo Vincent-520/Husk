@@ -8,8 +8,10 @@ import SwiftUI
 /// thing shown wherever JIT is missing, with the other methods one tap further. Once JIT is on it shrinks to a line saying so.
 struct JITCard: View {
     @ObservedObject private var jit = JITCoordinator.shared
+    /// One line instead of a card: for the library, where it sits above the games rather than being the page.
+    var compact = false
 
-    private var isOn: Bool { JITBootstrap.isDebuggerAttached || JITBootstrap.debuggedFlag }
+    private var isOn: Bool { JITBootstrap.ready }
 
     /// The way the card offers: StikJIT where Husk has it (iOS 26 and later), and otherwise whatever this device has -- TrollStore, a
     /// jailbreak -- since StikJIT cannot run on an iOS before 26.
@@ -20,11 +22,59 @@ struct JITCard: View {
     }
 
     var body: some View {
-        Group {
-            if isOn { on } else { off }
+        if compact {
+            if !isOn { strip }
+        } else {
+            Group {
+                if isOn { on } else { off }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 4)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 4)
+    }
+
+    /// JIT is off, the way to turn it on, and nothing else. The full story is a tap on the words away.
+    private var strip: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                Image(systemName: "bolt.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 32, height: 32)
+                    .background(Color.accentColor.opacity(0.16), in: Circle())
+                Button { jit.showSetup = true } label: {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("JIT is off").font(.subheadline.weight(.semibold)).foregroundStyle(.primary)
+                        Text(jit.busy ? (jit.status ?? "Turning on JIT…") : "Games need it. \(offered == .builtIn ? "StikJIT" : offered.title) turns it on.")
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                if jit.busy {
+                    ProgressView()
+                } else {
+                    Button {
+                        if offered == .builtIn, HuskBuiltInJIT.isAvailable { jit.method = .builtIn }
+                        jit.enable()
+                    } label: {
+                        Text("Turn On")
+                            .font(.subheadline.weight(.bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 14)
+                            .frame(height: 30)
+                            .background(Color.accentColor, in: Capsule())
+                    }
+                    .buttonStyle(CardButtonStyle())
+                }
+            }
+            if let error = jit.error {
+                Text(error).font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(12)
+        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 
     private var explanation: String {

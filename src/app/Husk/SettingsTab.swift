@@ -397,6 +397,7 @@ struct JITSettings: View {
     @ObservedObject private var runner = QemuRunner.shared
     @ObservedObject private var jit = JITCoordinator.shared
     @State private var autoStart = Onboarding.autoStart
+    @AppStorage(JITCoordinator.autoEnableKey) private var autoJIT = false
     @State private var keepAttached = JITBootstrap.keepDebuggerAttached
 
     private var pairingLabel: String {
@@ -427,7 +428,7 @@ struct JITSettings: View {
                           value: JITBootstrap.isInstalledWithTrollStore ? "yes" : "no", mono: false)
                 DetailRow(label: "Jailbreak",
                           value: JITBootstrap.debuggedAtLaunch ? "JIT allowed for apps"
-                               : JITBootstrap.isJailbroken ? "found; Allow JIT in Apps is off" : "not found", mono: false)
+                               : JITBootstrap.isJailbroken ? "found" : "not found", mono: false)
                 DetailRow(label: "Built-in pairing", value: pairingLabel, mono: false)
                 Button {
                     jit.showSetup = true
@@ -454,8 +455,14 @@ struct JITSettings: View {
                 // when someone reports "JIT does not work" these two rows are
                 // the whole diagnosis.
                 DetailRow(label: "Trap servicer",
-                          value: JITBootstrap.prewarmed ? "answering" : "not answering",
+                          value: husk_ios_jit_self_route() != nil ? "not needed"
+                               : JITBootstrap.prewarmed ? "answering" : "not answering",
                           mono: false)
+                if let route = husk_ios_jit_self_route() {
+                    DetailRow(label: "Made by Husk",
+                              value: String(cString: route) == "MAP_JIT" ? "MAP_JIT (TrollStore entitlement)" : "plain memory (debugged or jailbroken)",
+                              mono: false)
+                }
                 // Cached answer only: running the probe from a view body
                 // could freeze the app (see JITBootstrap.mapJITWorks).
                 DetailRow(label: "MAP_JIT",
@@ -469,7 +476,7 @@ struct JITSettings: View {
                 if let why = JITBootstrap.lastFailure {
                     Text(why).font(.caption).foregroundStyle(.orange)
                 }
-                if !JITBootstrap.isDebuggerAttached {
+                if !JITBootstrap.ready {
                     Button {
                         jit.enable()
                     } label: {
@@ -491,6 +498,16 @@ struct JITSettings: View {
                    + "which the kernel allows any debugged process. Either one is "
                    + "enough — which is available depends on the device and the iOS "
                    + "version, so Husk tests both rather than assuming.")
+            }
+
+            Section {
+                Toggle("Turn On JIT at Launch", isOn: $autoJIT)
+                    .disabled(!HuskBuiltInJIT.isAvailable)
+            } footer: {
+                Text(HuskBuiltInJIT.isAvailable
+                     ? "Each time Husk opens without JIT, it asks the built-in StikJIT to turn it on, so games are ready "
+                       + "without a tap. Needs StikJIT set up once (paired) first."
+                     : "Needs the built-in StikJIT, which is available on iOS 26 and later.")
             }
 
             Section {
@@ -537,6 +554,7 @@ struct SavedMachineSettings: View {
         UserDefaults.standard.object(forKey: "husk.downloadSnapshot") as? Bool ?? true
     @State private var askWhichToDelete = false
     @State private var deleteResult: String?
+    @AppStorage(GuestImage.askUpdatesKey) private var askUpdates = true
 
     var body: some View {
         Form {
@@ -585,6 +603,13 @@ struct SavedMachineSettings: View {
                 Text("Adds about 2 GB to the first download. It was captured on the "
                    + "software renderer, so it is not used on GPU — which cold-boots "
                    + "once and then saves its own.")
+            }
+
+            Section {
+                Toggle("Ask about Android updates", isOn: $askUpdates)
+            } footer: {
+                Text("When a new Android image or snapshot is published, Husk asks once whether to download it. "
+                   + "Never asked before Android has been downloaded.")
             }
         }
         .huskForm()
@@ -750,6 +775,11 @@ struct AboutSettings: View {
                         Text("Technical detail in the Android Translation Layer screens: "
                            + "library reports, device checks and run logs.")
                             .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                if devInfo {
+                    NavigationLink { TLChecksView() } label: {
+                        Label("Device Checks", systemImage: "stethoscope")
                     }
                 }
                 Button { showLogs = true } label: {

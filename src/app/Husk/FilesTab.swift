@@ -14,6 +14,7 @@ struct FilesTab: View {
 
     @ObservedObject private var host = AndroidHost.shared
     @ObservedObject private var router = Router.shared
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack(path: $router.files) {
@@ -21,6 +22,9 @@ struct FilesTab: View {
                 .navigationDestination(for: String.self) { path in
                     DirectoryView(path: path,
                                   title: (path as NSString).lastPathComponent)
+                }
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
                 }
         }
     }

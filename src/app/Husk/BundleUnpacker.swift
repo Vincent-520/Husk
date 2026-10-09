@@ -27,11 +27,20 @@ enum BundleUnpacker {
 
     /// The order an app's APKs are given to the runtime in, which takes only four: the app itself, then what it cannot run without (its 64-bit libraries, its asset pack),
     /// then the language and screen-density splits, which it does not need.
-    static func rank(_ name: String) -> Int {
+    ///
+    /// `siblings` are the app's other APK names. Besides Android's own split names (config.*, split_*), a split may be named
+    /// after the base: com.game.apk beside com.game.config.arm64_v8a.apk and com.game.SomeAssetPack.apk, the way Google
+    /// Play hands them out. A name that is another's name plus ".something" is that one's split.
+    static func rank(_ name: String, siblings: [String] = []) -> Int {
         let n = name.lowercased()
-        if !isSplit(n) { return 0 }
+        let named = siblings.contains { other in
+            let o = other.lowercased()
+            guard o != n, o.hasSuffix(".apk") else { return false }
+            return n.hasPrefix(String(o.dropLast(4)) + ".")
+        }
+        if !isSplit(n) && !named { return 0 }
         if n.contains("arm64") { return 1 }
-        if n.hasPrefix("asset_pack") || n.hasPrefix("install_time") { return 2 }
+        if n.hasPrefix("asset_pack") || n.hasPrefix("install_time") || (named && !n.contains(".config.")) { return 2 }
         return 3
     }
 

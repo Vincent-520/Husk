@@ -740,7 +740,89 @@ static void AudioManager_requestAudioFocus(tl_jcall *c) { c->ret = vi(1); /* AUD
 static void Uri_encode(tl_jcall *c) { c->ret = vl(STR(S(c->args[0].l))); }
 static void PAD_init(tl_jcall *c) { c->ret = vl(make("com/unity3d/player/PlayAssetDeliveryUnityWrapper")); }
 static void PAD_playCoreApiMissing(tl_jcall *c) { c->ret = vz(1); }
-static void FMOD_isRunning(tl_jcall *c) { c->ret = vz(1); }
+/*
+ * FMOD Ex's Java output (org.fmod.FMODAudioDevice), which Unity's audio uses on Android. In Java, start() runs a thread that
+ * asks the native mixer for each next block -- fmodProcess(ByteBuffer) fills a direct buffer and returns FMOD_OK (0) -- and
+ * writes it to an AudioTrack. Here the same thread is a host thread, and the block goes to the speakers through the shared
+ * audio output (tl_cocos_audio_hook), which blocks until there is room: that is what paces FMOD's mixer, as AudioTrack.write
+ * does on a phone. fmodGetInfo(0) is the mixer's sample rate and fmodGetInfo(1) its block length in frames; the output is
+ * 16-bit stereo.
+ */
+extern void (*tl_cocos_audio_hook)(const int16_t *samples, int frames, int channels, int rate);
+static struct { pthread_t thread; volatile int running; jobj *self; } g_fmodex;
+
+static void *fmodex_main(void *arg)
+{
+    (void)arg;
+    pthread_setname_np("FMODAudioDevice");
+    typedef int32_t (*info_fn)(void *env, void *self, int32_t which);
+    typedef int32_t (*process_fn)(void *env, void *self, void *buffer);
+    info_fn info = (info_fn)tl_jni_native("org/fmod/FMODAudioDevice", "fmodGetInfo", "(I)I");
+    process_fn process = (process_fn)tl_jni_native("org/fmod/FMODAudioDevice", "fmodProcess", "(Ljava/nio/ByteBuffer;)I");
+    if (!info || !process) { tl_log_line("fmod: FMODAudioDevice has no natives registered; no sound"); return NULL; }
+    void *env = tl_jni_env();
+    int rate = 0, frames = 0;
+    for (int tries = 0; g_fmodex.running && tries < 500; tries++) {
+        rate = info(env, g_fmodex.self, 0);
+        frames = info(env, g_fmodex.self, 1);
+        if (rate > 0 && frames > 0) break;
+        usleep(10000);
+    }
+    if (rate <= 0 || frames <= 0 || frames > 65536) {
+        tl_log_line("fmod: the mixer never said its rate and block size (%d Hz, %d frames); no sound", rate, frames);
+        return NULL;
+    }
+    int16_t *block = calloc((size_t)frames * 2, sizeof(int16_t));
+    jobj *buffer = tl_jni_new_object(tl_jni_class("java/nio/DirectByteBuffer"));
+    jvalue address, capacity; address.l = block; capacity.j = (int64_t)frames * 2 * (int64_t)sizeof(int16_t);
+    tl_jni_set_field(buffer, "address", "J", address);
+    tl_jni_set_field(buffer, "capacity", "J", capacity);
+    tl_log_line("fmod: FMODAudioDevice playing, %d Hz stereo, %d frames a block (info 2..5: %d %d %d %d)", rate, frames,
+                info(env, g_fmodex.self, 2), info(env, g_fmodex.self, 3), info(env, g_fmodex.self, 4), info(env, g_fmodex.self, 5));
+    bool said = false;
+    /* TL_FMOD_PROBE=1: fill the block with a marker first and log how much of it FMOD wrote -- its real block layout. */
+    int probe = getenv("TL_FMOD_PROBE") ? 40 : 0;
+    while (g_fmodex.running) {
+        if (probe) for (int i = 0; i < frames * 2; i++) block[i] = 0x5A5A;
+        int r = process(env, g_fmodex.self, buffer);
+        if (probe && r == 0) {
+            int last = -1, untouched = 0;
+            for (int i = 0; i < frames * 2; i++) { if (block[i] != 0x5A5A) last = i; else untouched++; }
+            tl_log_line("fmod probe: wrote up to sample %d of %d, %d untouched; first samples %d %d %d %d %d %d", last + 1, frames * 2, untouched,
+                        block[0], block[1], block[2], block[3], block[4], block[5]);
+            probe--;
+        }
+        if (r != 0 && !said) { tl_log_line("fmod: fmodProcess -> %d (not FMOD_OK); waiting", r); said = true; }
+        { static FILE *dump; static int tried; if (!tried) { tried = 1; if (getenv("TL_FMOD_DUMP")) dump = fopen(getenv("TL_FMOD_DUMP"), "wb"); }
+          if (dump && r == 0) fwrite(block, sizeof(int16_t), (size_t)frames * 2, dump); }
+        if (r == 0 && tl_cocos_audio_hook) tl_cocos_audio_hook(block, frames, 2, rate);
+        else usleep(2000);
+    }
+    free(block);
+    return NULL;
+}
+
+static void FMODEx_start(tl_jcall *c)
+{
+    if (g_fmodex.running) return;
+    g_fmodex.self = c->self;
+    g_fmodex.running = 1;
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, 1u << 20);
+    if (pthread_create(&g_fmodex.thread, &a, fmodex_main, NULL) != 0) g_fmodex.running = 0;
+    pthread_attr_destroy(&a);
+}
+
+static void FMODEx_stop(tl_jcall *c)
+{
+    (void)c;
+    if (!g_fmodex.running) return;
+    g_fmodex.running = 0;
+    pthread_join(g_fmodex.thread, NULL);
+}
+
+static void FMOD_isRunning(tl_jcall *c) { c->ret = vz(g_fmodex.running != 0); }
 
 /* ------------------------------------------------------------------ tables */
 
@@ -957,8 +1039,8 @@ static const tl_jhle k_hle[] = {
     M("com/unity3d/player/PlayAssetDeliveryUnityWrapper", "playCoreApiMissing", "()Z", PAD_playCoreApiMissing),
     M("com/unity3d/player/UnityCoreAssetPacksStatusCallbacks", "<init>", "()V", Noop),
     M("com/unity3d/player/HFPStatus", "clearHFPStat", "()V", Noop),
-    M("org/fmod/FMODAudioDevice", "<init>", "()V", Noop), M("org/fmod/FMODAudioDevice", "start", "()V", Noop),
-    M("org/fmod/FMODAudioDevice", "stop", "()V", Noop), M("org/fmod/FMODAudioDevice", "isRunning", "()Z", FMOD_isRunning),
+    M("org/fmod/FMODAudioDevice", "<init>", "()V", Noop), M("org/fmod/FMODAudioDevice", "start", "()V", FMODEx_start),
+    M("org/fmod/FMODAudioDevice", "stop", "()V", FMODEx_stop), M("org/fmod/FMODAudioDevice", "close", "()V", FMODEx_stop), M("org/fmod/FMODAudioDevice", "isRunning", "()Z", FMOD_isRunning),
     M("com/unity3d/player/UnityPlayer", "initializeGoogleAr", "()Z", UnityPlayer_initializeGoogleAr),
     M("bitter/jnibridge/JNIBridge", "newInterfaceProxy", "(J[Ljava/lang/Class;)Ljava/lang/Object;", JNIBridge_newInterfaceProxy),
     M("com/unity3d/player/ReflectionHelper", "getConstructorID", "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/reflect/Constructor;", Reflection_getConstructorID),
@@ -989,6 +1071,7 @@ void tl_hle_configure(const char *pkg, const char *apk, const char *data, int w,
 }
 
 jobj *tl_hle_activity(void) { return H.activity; }
+int tl_hle_version_code(void) { return H.version_code; }
 /* An app whose activity is its own class (Minecraft's MainActivity) swaps its instance in for the generic one. */
 void tl_hle_set_activity(jobj *a) { H.activity = a; }
 jobj *tl_hle_assets(void) { return H.assets; }
@@ -997,6 +1080,7 @@ jobj *tl_hle_config(void) { return H.config; }
 extern void tl_loop_install(void);
 extern void tl_input_install(void);
 extern void tl_tls_install(void);
+extern void tl_gms_install(void);
 void tl_jni_hle_install(void)
 {
     for (size_t i = 0; i < sizeof(k_classes) / sizeof(k_classes[0]); i++) tl_jni_declare(k_classes[i].name, k_classes[i].super);
@@ -1006,6 +1090,7 @@ void tl_jni_hle_install(void)
     tl_input_install();
     tl_tls_install();
     tl_http_install();
+    tl_gms_install();
 
     H.activity = make("android/app/Activity");
     H.resources = make("android/content/res/Resources");
@@ -1023,6 +1108,15 @@ void tl_jni_hle_install(void)
     set_str(H.appinfo, "nativeLibraryDir", H.native_lib); set_str(H.appinfo, "dataDir", H.data);
     set_str(H.appinfo, "packageName", H.pkg); set_int(H.appinfo, "flags", 0x8000 /* FLAG_HAS_CODE */);
     set_int(H.appinfo, "targetSdkVersion", 36); set_int(H.appinfo, "minSdkVersion", 24);
+    /* A Google Play install's split APKs (64-bit libraries, asset packs): where Unity finds its data when it is in a pack. */
+    int nsplit = 0;
+    while (tl_ld_queued_split(nsplit)) nsplit++;
+    if (nsplit) {
+        jobj *dirs = tl_jni_new_obj_array(tl_jni_class("java/lang/String"), (uint32_t)nsplit);
+        for (int i = 0; i < nsplit; i++) dirs->oarr.v[i] = STR(tl_ld_queued_split(i));
+        tl_jni_set_field(H.appinfo, "splitSourceDirs", "[Ljava/lang/String;", vl(dirs));
+        tl_jni_set_field(H.appinfo, "splitPublicSourceDirs", "[Ljava/lang/String;", vl(tl_jni_ref(dirs)));
+    }
     H.pm = make("android/content/pm/PackageManager");
     H.display = make("android/view/Display");
     H.wm = make("android/view/WindowManager");

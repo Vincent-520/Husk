@@ -622,6 +622,8 @@ wanted = [
     "husk_ios_jit_mapjit_works",
     "husk_ios_jit_detach",
     "husk_ios_jit_log_footprint",
+    "husk_ios_jit_get_mapping",
+    "husk_ios_jit_self_route",
     "husk_ios_available_memory",
 ]
 _present = _re.findall(r"^\s*(husk_\w+);", s, _re.M)

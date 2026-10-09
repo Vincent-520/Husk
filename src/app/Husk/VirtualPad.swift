@@ -49,6 +49,39 @@ final class VirtualPad: ObservableObject {
     }
 }
 
+/// Where a player has moved, resized or hidden the pad's controls, per game. The default layout is worked out from the
+/// screen; this is applied over it, so a layout made in one orientation or on one phone still fits another.
+struct PadLayout: Codable, Equatable {
+    struct Adjust: Codable, Equatable {
+        var dx: CGFloat = 0, dy: CGFloat = 0     // the move, as a fraction of the screen's width and height
+        var scale: CGFloat = 1
+        var hidden = false
+    }
+    var controls: [String: Adjust] = [:]
+
+    subscript(_ id: String) -> Adjust {
+        get { controls[id] ?? Adjust() }
+        set { controls[id] = newValue == Adjust() ? nil : newValue }
+    }
+
+    private static func file(_ appID: String) -> URL {
+        TranslationLayer.root.appendingPathComponent(appID, isDirectory: true).appendingPathComponent("pad-layout.json")
+    }
+    static func load(_ appID: String) -> PadLayout {
+        guard let data = try? Data(contentsOf: file(appID)), let l = try? JSONDecoder().decode(PadLayout.self, from: data) else { return PadLayout() }
+        return l
+    }
+    func save(_ appID: String) {
+        if controls.isEmpty { try? FileManager.default.removeItem(at: Self.file(appID)); return }
+        if let data = try? JSONEncoder().encode(self) { try? data.write(to: Self.file(appID), options: .atomic) }
+    }
+
+    /// The names the editor shows.
+    static func name(_ id: String) -> String {
+        ["lstick": "Left stick", "rstick": "Right stick", "dpad": "D-pad", "back": "Back", "start": "Start"][id] ?? id.uppercased()
+    }
+}
+
 /// The pad as an overlay on the game. It is one UIKit view that does its own multi-touch hit-testing and drawing rather than a
 /// SwiftUI view per key: with a gesture on every key, SwiftUI has to settle which of several overlapping recognizers owns a touch
 /// before any of them fires (a key only registered once the finger had moved), a key's hit area was just its drawn size so a
@@ -59,17 +92,26 @@ struct VirtualPadView: UIViewRepresentable {
     let pad: VirtualPad
     var opacity: Double = 1
     var haptics = true
+    var layout = PadLayout()
+    /// Editing: touches move controls instead of pressing them, and the one touched last is `selected`.
+    var editing = false
+    var selected: Binding<String?>? = nil
+    var onChange: ((PadLayout) -> Void)? = nil
 
     func makeUIView(context: Context) -> PadView {
         pad.connect()
         let view = PadView(pad: pad)
-        view.alpha = opacity
-        view.hapticsEnabled = haptics
+        update(view)
         return view
     }
-    func updateUIView(_ view: PadView, context: Context) {
-        view.alpha = opacity
+    func updateUIView(_ view: PadView, context: Context) { update(view) }
+
+    private func update(_ view: PadView) {
+        view.alpha = editing ? max(opacity, 0.85) : opacity
         view.hapticsEnabled = haptics
+        view.onChange = onChange
+        view.onSelect = { id in selected?.wrappedValue = id }
+        view.configure(layout: layout, editing: editing, selected: selected?.wrappedValue)
     }
     static func dismantleUIView(_ view: PadView, coordinator: ()) { view.pad.disconnect() }
 }
@@ -87,9 +129,19 @@ final class PadView: UIView {
     }
     private struct Control {
         let kind: Kind
-        let center: CGPoint
-        let size: CGSize                              // a circle's diameter in width, or the key's width and height
+        var center: CGPoint
+        var size: CGSize                              // a circle's diameter in width, or the key's width and height
+        var hidden = false
         var radius: CGFloat { min(size.width, size.height) / 2 }
+
+        /// Its name in a saved layout.
+        var id: String {
+            switch kind {
+            case .button(_, let l), .bumper(_, let l), .trigger(_, let l): return l.lowercased()
+            case .stick(let left): return left ? "lstick" : "rstick"
+            case .dpad: return "dpad"
+            }
+        }
     }
     /// What one finger is doing: holding a stick, or pressing whatever is under it (and following it as it slides).
     private struct Finger {
@@ -105,6 +157,23 @@ final class PadView: UIView {
     private let haptic = UIImpactFeedbackGenerator(style: .light)
     var hapticsEnabled = true
 
+    // Editing.
+    private var adjustments = PadLayout()
+    private var editing = false
+    private var selectedID: String?
+    private var drag: (id: String, start: CGPoint, from: PadLayout.Adjust)?
+    var onChange: ((PadLayout) -> Void)?
+    var onSelect: ((String?) -> Void)?
+
+    func configure(layout: PadLayout, editing: Bool, selected: String?) {
+        let changed = layout != adjustments || editing != self.editing || selected != selectedID
+        adjustments = layout
+        if editing != self.editing { fingers.removeAll(); drag = nil; if editing { pad.send(VirtualPad.State()) } }
+        self.editing = editing
+        selectedID = selected
+        if changed { setNeedsLayout(); setNeedsDisplay() }
+    }
+
     init(pad: VirtualPad) {
         self.pad = pad
         super.init(frame: .zero)
@@ -119,7 +188,14 @@ final class PadView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        controls = layout(in: bounds)
+        controls = layout(in: bounds).map { c in
+            let a = adjustments[c.id]
+            var c = c
+            c.center = CGPoint(x: c.center.x + a.dx * bounds.width, y: c.center.y + a.dy * bounds.height)
+            c.size = CGSize(width: c.size.width * a.scale, height: c.size.height * a.scale)
+            c.hidden = a.hidden
+            return c
+        }
         setNeedsDisplay()
     }
 
@@ -127,9 +203,11 @@ final class PadView: UIView {
     private func layout(in bounds: CGRect) -> [Control] {
         let w = bounds.width, h = bounds.height
         guard w > 0, h > 0 else { return [] }
-        let k = max(0.7, min(1.15, h / 372))
+        let isPad = UIDevice.current.userInterfaceIdiom == .pad
+        // On iPad, clamp k to a comfortable hand reach size rather than scaling indefinitely with height
+        let k = isPad ? 1.15 : max(0.7, min(1.15, h / 372))
         let insets = window?.safeAreaInsets ?? safeAreaInsets
-        let left = max(insets.left, 8), right = max(insets.right, 8), bottom = max(insets.bottom, 8)
+        let left = max(insets.left, isPad ? 20 : 8), right = max(insets.right, isPad ? 20 : 8), bottom = max(insets.bottom, isPad ? 20 : 8)
         let m = 16 * k
         var list: [Control] = []
 
@@ -178,6 +256,7 @@ final class PadView: UIView {
     private func control(at p: CGPoint) -> Int? {
         var best: (Int, CGFloat)?
         for (i, c) in controls.enumerated() {
+            if c.hidden && !editing { continue }
             let r = reach(c, p)
             if r <= 1, best == nil || r < best!.1 { best = (i, r) }
         }
@@ -186,7 +265,8 @@ final class PadView: UIView {
 
     /// Only the controls take touches; everywhere else the game underneath gets them.
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        control(at: point) != nil ? self : nil
+        if editing { return self }      // while editing, the game gets nothing
+        return control(at: point) != nil ? self : nil
     }
 
     /// What a finger at `p` presses, for one that is not holding a stick.
@@ -225,6 +305,20 @@ final class PadView: UIView {
     // MARK: touches
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if editing {
+            guard let t = touches.first else { return }
+            let p = t.location(in: self)
+            if let i = control(at: p) {
+                let id = controls[i].id
+                drag = (id, p, adjustments[id])
+                selectedID = id
+            } else {
+                selectedID = nil
+            }
+            onSelect?(selectedID)
+            setNeedsDisplay()
+            return
+        }
         for t in touches {
             let p = t.location(in: self)
             if let i = control(at: p), case .stick = controls[i].kind {
@@ -239,6 +333,16 @@ final class PadView: UIView {
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if editing {
+            guard let d = drag, let t = touches.first, bounds.width > 0, bounds.height > 0 else { return }
+            let p = t.location(in: self)
+            var a = d.from
+            a.dx += (p.x - d.start.x) / bounds.width
+            a.dy += (p.y - d.start.y) / bounds.height
+            adjustments[d.id] = a
+            setNeedsLayout()
+            return
+        }
         for t in touches {
             guard var f = fingers[t] else { continue }
             let p = t.location(in: self)
@@ -249,11 +353,16 @@ final class PadView: UIView {
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if editing {
+            if drag != nil { drag = nil; onChange?(adjustments) }
+            return
+        }
         for t in touches { fingers[t] = nil }
         apply()
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if editing { drag = nil; return }
         for t in touches { fingers[t] = nil }
         apply()
     }
@@ -288,6 +397,22 @@ final class PadView: UIView {
 
     override func draw(_ rect: CGRect) {
         for c in controls {
+            if c.hidden && !editing { continue }
+            let ctx = UIGraphicsGetCurrentContext()
+            ctx?.saveGState()
+            if c.hidden { ctx?.setAlpha(0.3) }
+            defer {
+                ctx?.restoreGState()
+                if editing, c.id == selectedID {
+                    let pad: CGFloat = 6
+                    let box = CGRect(x: c.center.x - c.size.width / 2 - pad, y: c.center.y - c.size.height / 2 - pad,
+                                     width: c.size.width + pad * 2, height: c.size.height + pad * 2)
+                    let sel = UIBezierPath(roundedRect: box, cornerRadius: 10)
+                    sel.lineWidth = 2
+                    sel.setLineDash([6, 4], count: 2, phase: 0)
+                    UIColor.systemYellow.setStroke(); sel.stroke()
+                }
+            }
             switch c.kind {
             case .stick(let left):
                 drawStick(c, push: stickPush(left: left))

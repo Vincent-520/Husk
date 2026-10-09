@@ -28,6 +28,12 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage(Theme.Appearance.key) private var appearance = Theme.Appearance.system
     @ObservedObject private var theme = AppTheme.shared
+    @ObservedObject private var incoming = IncomingFiles.shared
+    @ObservedObject private var showcase = ShowcaseStore.shared
+    @ObservedObject private var tlStore = TranslationLayerStore.shared
+    @ObservedObject private var crash = CrashReport.shared
+    @ObservedObject private var updates = AppUpdates.shared
+    @State private var showWhatsNew = false
 
     var body: some View {
         ZStack {
@@ -41,28 +47,21 @@ struct ContentView: View {
             // Android is then a matter of hiding what is over it, which is also
             // why it appears instantly rather than reloading.
             TabView(selection: $router.tab) {
-                TranslationLayerTab()
-                    .tabItem { Label("Native", systemImage: "gamecontroller.fill") }
-                    .tag(HuskTab.translation)
+                HomeView()
+                    .tabItem { Label("Home", systemImage: "house.fill") }
+                    .tag(HuskTab.home)
 
-                // Only the tabs that are Android's wait for its download; the Native games and Settings never need it.
-                Group {
-                    if showSetup {
-                        SetupView(showLogs: $showLogs)
-                    } else {
-                        LibraryTab(onOpenGuest: { showGuestScreen = true },
-                                   onStartAndroid: startFromLibrary,
-                                   started: started && runner.isRunning)
-                    }
-                }
+                LibraryScreen()
                     .tabItem { Label("Library", systemImage: "square.grid.2x2.fill") }
                     .tag(HuskTab.library)
 
-                Group {
-                    if showSetup { SetupView(showLogs: $showLogs) } else { FilesTab() }
-                }
-                    .tabItem { Label("Files", systemImage: "folder.fill") }
-                    .tag(HuskTab.files)
+                StoreView()
+                    .tabItem { Label("Store", systemImage: "cart.fill") }
+                    .tag(HuskTab.store)
+
+                DownloadsTab()
+                    .tabItem { Label("Downloads", systemImage: "arrow.down.circle.fill") }
+                    .tag(HuskTab.downloads)
 
                 SettingsTab()
                     .tabItem { Label("Settings", systemImage: "gearshape.fill") }
@@ -119,13 +118,63 @@ struct ContentView: View {
         .fullScreenCover(isPresented: $showOnboarding) {
             OnboardingView {
                 showOnboarding = false
-                if Onboarding.autoStart, JITBootstrap.isDebuggerAttached {
+                if Onboarding.autoStart, JITBootstrap.ready {
                     booting = true
                     start()
                 }
             }
         }
         .sheet(isPresented: $showLogs) { LogView() }
+        // A game that ended Husk last time: say so, with its report.
+        .sheet(item: Binding(get: { showOnboarding ? nil : crash.pending }, set: { crash.pending = $0 }),
+               onDismiss: { if WhatsNew.due { showWhatsNew = true } }) { r in
+            CrashReportSheet(report: r)
+        }
+        // After an update: what it brought, once.
+        .fullScreenCover(isPresented: $showWhatsNew) {
+            WhatsNewSheet { WhatsNew.markSeen(); showWhatsNew = false }
+        }
+        // A newer Husk is on GitHub.
+        .alert("Husk \(updates.available?.version ?? "") Is Available", isPresented: Binding(
+                get: { updates.available != nil && !showOnboarding && !showWhatsNew && crash.pending == nil },
+                set: { if !$0 { updates.dismiss() } })) {
+            Button("View Release") {
+                if let page = updates.available?.page { UIApplication.shared.open(page) }
+                updates.dismiss()
+            }
+            Button("Not Now", role: .cancel) { updates.dismiss() }
+        } message: {
+            Text("You have \(AppUpdates.current). The new version's IPA is on its release page.")
+        }
+        .task { await updates.check() }
+        .sheet(isPresented: $router.showFiles) { FilesTab() }
+        // Pictures for the apps here: read the index on launch and whenever the set of apps changes.
+        .task(id: showcasePackages) { showcase.refresh(for: showcasePackages) }
+        .alert("Metadata Updated", isPresented: Binding(get: { showcase.shouldAsk && !showOnboarding },
+                                                         set: { if !$0 { showcase.asked() } })) {
+            Button("Download") { showcase.downloadUpdates() }
+            Button("Not Now", role: .cancel) { showcase.asked() }
+        } message: {
+            let n = showcase.updates.count
+            Text("Metadata for \(n) of your app\(n == 1 ? "" : "s") has been updated. Would you like to download the updates?")
+        }
+        // An APK shared to Husk: where does it go?
+        .sheet(isPresented: Binding(get: { !incoming.waiting.isEmpty },
+                                    set: { if !$0 { incoming.discard() } })) {
+            IncomingChooser()
+                .presentationDetents([.medium])
+                .presentationDragIndicator(.visible)
+        }
+        // APKs meant for Android wait until it can take them.
+        .onChange(of: host.isReady) { ready in
+            incoming.installForAndroidIfReady()
+            // An app asked for while Android was off: open it now.
+            if ready, let pkg = router.pendingAndroidLaunch {
+                router.pendingAndroidLaunch = nil
+                host.launch(pkg) { showGuestScreen = true }
+            }
+        }
+        .onChange(of: host.busy) { _ in incoming.installForAndroidIfReady() }
         .sheet(isPresented: $jit.showSetup) { JITSetupFlow() }
         // The built-in helper attaches while Husk stays in the foreground, so
         // there is no relaunch to trigger the region claim below; this is it.
@@ -140,10 +189,17 @@ struct ContentView: View {
         } message: {
             Text(guest.update.detail)
         }
-        .onAppear { evaluate() }
+        .onAppear {
+            crash.checkPreviousRun()
+            if crash.pending == nil { router.resumeSwitch() }
+            if crash.pending == nil, WhatsNew.due { showWhatsNew = true }
+            router.openGuest = { showGuestScreen = true }
+            router.startAndroid = { startFromLibrary() }
+            evaluate()
+        }
         // The two-parameter onChange is iOS 17; this single-parameter form is
         // deprecated there but still works, and is the only one that compiles
-        // against the 16.4 deployment target.
+        // against the 16.0 deployment target.
         .onChange(of: scenePhase) { phase in
             // StikDebug relaunches Husk after attaching, so returning to the
             // foreground is the moment worth re-checking, not first launch.
@@ -151,7 +207,14 @@ struct ContentView: View {
         }
     }
 
+    /// Every package Husk holds, from both sides: what the picture index is read for.
+    private var showcasePackages: Set<String> {
+        Set(tlStore.apps.compactMap(\.packageName) + host.packages.map(\.name))
+    }
+
     private func evaluate() {
+        // Before anything else wants JIT: the setting that turns it on as Husk opens.
+        jit.enableAtLaunchIfAsked()
         try? guest.prepareFirmware()
         guest.refresh()
         HuskBridgeFS.shared.prepare()
@@ -161,8 +224,8 @@ struct ContentView: View {
         // network round trip, and nothing on this screen should wait for it.
         Task { await guest.checkForUpdates() }
 
-        if !JITBootstrap.isDebuggerAttached {
-            HuskLog.log("ui", "no debugger attached; waiting for StikDebug")
+        if !JITBootstrap.ready {
+            HuskLog.log("ui", "no JIT yet; waiting for a debugger")
             return
         }
 
@@ -187,27 +250,13 @@ struct ContentView: View {
         start()
     }
 
-    /// Whether the start screen should be up at all.
-    ///
-    /// Only while there is no runtime to launch: once the guest image is on
-    /// disk the tab UI is the home screen. This used to also stay up whenever
-    /// no third-party packages were installed, which pinned anyone who had
-    /// only ever run Android full-screen to the two start cards on every
-    /// launch -- and with JIT off put a second copy of the JIT message over
-    /// the library's own. The library already says all of it: Start when it
-    /// can, "Husk needs JIT" when it cannot, install an APK when there is
-    /// nothing here.
-    private var showSetup: Bool {
-        !started && guest.state != .ready
-    }
-
     /// Start the guest from the library, without leaving it.
     ///
     /// `start()` returns silently when there is no debugger attached, which as
     /// the action behind a button reads as a button that does nothing, so the
     /// JIT prompt is raised here instead.
     private func startFromLibrary() {
-        guard JITBootstrap.isDebuggerAttached else {
+        guard JITBootstrap.ready else {
             HuskLog.log("ui", "start asked for without JIT; enabling with \(jit.resolvedMethod.title)")
             jit.enable()
             return
@@ -217,8 +266,8 @@ struct ContentView: View {
 
     private func start() {
         guard !started else { return }
-        guard JITBootstrap.isDebuggerAttached else { return }
-        HuskLog.log("ui", "CS_DEBUGGED set; starting QEMU")
+        guard JITBootstrap.ready else { return }
+        HuskLog.log("ui", "JIT is available; starting QEMU")
         // Take the JIT region at the last moment before QEMU, as well as before
         // the download. Whichever comes first wins; the second call is a no-op.
         //
@@ -249,6 +298,7 @@ struct ContentView: View {
                              + "QEMU map its own buffer")
         }
         started = true
+        router.androidStarted = true
         QemuRunner.shared.start()
         // Start probing the bridge now, not when the library happens to be
         // opened. isReady is only ever set here, and under the old screen-based
@@ -426,182 +476,6 @@ struct GuestScreenView: View {
     }
 }
 
-/// The runtime download screen: what shows while there is no guest image on
-/// disk to launch -- missing, downloading, installing, or failed (see
-/// ContentView.showSetup for when that is).
-struct SetupView: View {
-    @ObservedObject private var guest = GuestImage.shared
-    @ObservedObject private var runner = QemuRunner.shared
-    @Environment(\.colorScheme) private var scheme
-    @Binding var showLogs: Bool
-
-    @State private var profile: QemuRunner.Profile = .phase1Android
-    @State private var showSettings = false
-
-    var body: some View {
-        ZStack {
-            Theme.backdrop
-            VStack(spacing: 20) {
-                // The icon the user is actually using, so the first screen and
-                // the home screen agree. This used to be a fixed copy of the
-                // default artwork, which quietly disagreed with both.
-                HuskMark(size: 92)
-                    .shadow(color: Theme.accent.opacity(0.3), radius: 24, y: 10)
-                // Letterspaced, as a wordmark rather than a heading: this is
-                // the only screen in the app that is allowed to be a title card.
-                Text("HUSK")
-                    .font(.system(size: 26, weight: .semibold))
-                    .tracking(10)
-                    .padding(.leading, 10)
-                Text("Android apps, on your iPhone")
-                    .font(.system(size: 13))
-                    .foregroundStyle(Theme.textDim)
-                    .padding(.top, -8)
-
-                content
-            }
-            .foregroundStyle(Theme.text)
-
-            // Settings, top right, out of the way of the one thing most people
-            // open this screen to press.
-            VStack {
-                HStack {
-                    Spacer()
-                    Button { showSettings = true } label: {
-                        Image(systemName: "gearshape")
-                            .font(.title2)
-                            .foregroundStyle(Theme.text.opacity(0.75))
-                            .padding(14)
-                    }
-                }
-                Spacer()
-            }
-        }
-        .sheet(isPresented: $showSettings) {
-            SettingsTab()
-        }
-    }
-
-    @ViewBuilder
-    private var content: some View {
-        if runner.isRunning {
-            // Android's first boot is slow under TCG and its one-time setup is
-            // slower still, so say what is happening rather than showing a black
-            // screen for minutes.
-            VStack(spacing: 12) {
-                // A determinate bar once the guest has said anything at all.
-                // Before that there is nothing to be determinate about, and a
-                // bar sitting at zero reads as stuck rather than starting.
-                if runner.bootProgress > 0 {
-                    ProgressView(value: Double(runner.bootProgress), total: 100)
-                        .progressViewStyle(.linear)
-                        .frame(maxWidth: 240)
-                } else {
-                    ProgressView()
-                }
-                Text(runner.setupMessage.map { "Android: \($0)" } ?? "Starting Android…")
-                    .font(.callout).foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center).padding(.horizontal, 36)
-                Text("First run downloads Android and can take several minutes.")
-                    .font(.caption2).foregroundStyle(.tertiary)
-                    .multilineTextAlignment(.center).padding(.horizontal, 40)
-            }
-        } else {
-            switch guest.state {
-            case .downloading(let p, let received, let total):
-                VStack(spacing: 10) {
-                    Text(guest.hasShippedSnapshot || GuestImage.shared.isFetchingSnapshot
-                         ? "Downloading pre-booted Android"
-                         : "Downloading Android runtime").font(.headline)
-                    ProgressView(value: p).padding(.horizontal, 50)
-                    Text("\(fmt(received)) of \(total > 0 ? fmt(total) : "…")")
-                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                    Button("Cancel") { guest.cancel() }.font(.footnote)
-                }
-            case .installing:
-                VStack(spacing: 10) { ProgressView(); Text("Installing…").font(.callout) }
-            case .failed(let message):
-                VStack(spacing: 10) {
-                    Text("Something went wrong").font(.headline).foregroundStyle(.red)
-                    Text(message).font(.caption).foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center).padding(.horizontal, 34)
-                    Button("Try again") { JITBootstrap.prewarm(); guest.download() }.buttonStyle(.borderedProminent)
-                }
-            case .missing:
-                VStack(spacing: 12) {
-                    Text("Husk needs its Android runtime — about 760 MB. Android itself is downloaded afterwards by the runtime.")
-                        .font(.callout).foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center).padding(.horizontal, 36)
-                    Button("Download Android runtime") {
-                        // Claim the JIT region before the download, not after:
-                        // it takes about a minute, and StikDebug will have let
-                        // go by the end of it.
-                        JITBootstrap.prewarm()
-                        guest.download()
-                    }
-                        .buttonStyle(.borderedProminent)
-                }
-            case .ready:
-                // Unreachable: SetupView is mounted only while there is no
-                // runtime to launch -- ContentView.showSetup is false the
-                // moment the image on disk is valid, and the tab UI takes over
-                // from there. The start cards and the JIT hand-off that used
-                // to live here are covered by the library. An empty arm keeps
-                // the switch exhaustive.
-                EmptyView()
-            }
-        }
-    }
-
-    private func fmt(_ bytes: Int64) -> String {
-        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
-    }
-}
-
-/// An app's icon, or the placeholder while it is being fetched.
-///
-/// Loaded from the file rather than held in memory: icons arrive one at a time
-/// over the guest bridge, and a list that redraws when each lands should not
-/// also be carrying every decoded bitmap around with it.
-struct AppIcon: View {
-    let path: String?
-    /// The side of the square it draws itself in.
-    ///
-    /// It used to pin itself to 40pt internally, so the 62pt tile and the 96pt
-    /// header both got a 40pt picture floating in the middle of a much bigger
-    /// box -- which is most of why the grid looked like a debug list. The size
-    /// belongs to whoever is placing it.
-    var size: CGFloat = 40
-
-    /// Proportional, so a large icon is not rounded like a small one. This is
-    /// close to the ratio iOS uses for a home screen icon.
-    private var corner: CGFloat { size * 0.225 }
-
-    var body: some View {
-        Group {
-            if let path, let image = UIImage(contentsOfFile: path) {
-                Image(uiImage: image)
-                    .resizable()
-                    .interpolation(.medium)
-                    .aspectRatio(contentMode: .fit)
-            } else {
-                // A placeholder that looks like an icon rather than a missing
-                // one: most of the grid can be placeholders for the first
-                // minute of a session, and a row of grey glyphs reads as broken.
-                ZStack {
-                    Theme.accentSoft
-                    Image(systemName: "app.dashed")
-                        .font(.system(size: size * 0.42, weight: .light))
-                        .foregroundStyle(Theme.accent.opacity(0.8))
-                }
-            }
-        }
-        .frame(width: size, height: size)
-        // Rounded like a launcher would draw it. Android icons are square
-        // PNGs; nothing else gives them an app-like shape.
-        .clipShape(RoundedRectangle(cornerRadius: corner, style: .continuous))
-    }
-}
 /// Live log tail with a share button. The share sheet is the practical way to get
 /// husk.log and the guest's serial console off the device.
 /// Settings, reached from the gear on the start screen.

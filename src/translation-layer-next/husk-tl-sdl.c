@@ -19,6 +19,7 @@
 #include "husk-tl-jni.h"
 #include "husk-tl-internal.h"
 #include "husk-tl-ld.h"
+#include "husk-tl-vulkan.h"
 
 void tl_jni_hle_install(void);
 void tl_hle_configure(const char *pkg, const char *apk, const char *data, int w, int h);
@@ -258,7 +259,18 @@ static void A_pollInputDevices(tl_jcall *c)
     void (*remove)(void *, void *, int) = native_of(SDLCTRL, "nativeRemoveJoystick", "(I)V");
     for (int slot = 0; slot < TL_PADS; slot++) {
         bool connected = tl_pad_connected(slot), announced = (atomic_load(&g_pads_announced) >> slot) & 1;
-        if (connected && !announced && add) {
+        if (connected && !announced && S.sdl2) {
+            /* SDL 2: nativeAddJoystick(id, name, desc, vendor, product, is_accelerometer, button_mask, naxes, [axis_mask,] nhats, nballs) -> int. 2.24 added the
+             * axis mask. Past the eighth argument they go on the stack, where Android gives every one a slot of 8 bytes: passed as 64-bit values here. */
+            void *fn = native_of(SDLCTRL, "nativeAddJoystick", "(ILjava/lang/String;Ljava/lang/String;IIZIIIII)I");
+            bool st, mask = tl_dexidx_declares_method(SDLCTRL, "nativeAddJoystick", "(ILjava/lang/String;Ljava/lang/String;IIZIIIII)I", &st);
+            char desc[40]; snprintf(desc, sizeof(desc), "husk-xbox-%d", slot);
+            void *env = tl_jni_env(), *cls = tl_jni_class_object(SDLCTRL), *name = tl_jni_new_string("Xbox Wireless Controller"), *d = tl_jni_new_string(desc);
+            if (fn && mask) ((int (*)(void *, void *, int, void *, void *, int, int, int, int64_t, int64_t, int64_t, int64_t, int64_t))fn)(env, cls, PAD_ID(slot), name, d, 0x045e, 0x02fd, 0, 0x7fff, 6, 0x003f, 0, 0);
+            else if (fn) ((int (*)(void *, void *, int, void *, void *, int, int, int, int64_t, int64_t, int64_t, int64_t))fn)(env, cls, PAD_ID(slot), name, d, 0x045e, 0x02fd, 0, 0x7fff, 6, 0, 0);
+            if (fn) tl_log_line("sdl: controller %d announced to SDL 2%s", slot, mask ? "" : " (no axis mask)");
+            atomic_fetch_or(&g_pads_announced, 1 << slot);
+        } else if (connected && !announced && add) {
             char desc[40]; snprintf(desc, sizeof(desc), "husk-xbox-%d", slot);
             /* 0x045e:0x02fd, an Xbox One S over Bluetooth; buttons A B X Y Back Guide Start Lstick Rstick L1 R1 and the D-pad; six axes (two sticks and two triggers), no hat -- the D-pad is buttons. */
             add(tl_jni_env(), tl_jni_class_object(SDLCTRL), PAD_ID(slot), tl_jni_new_string("Xbox Wireless Controller"), tl_jni_new_string(desc), 0x045e, 0x02fd, 0x7fff, 6, 0x003f, 0, 0);
@@ -717,10 +729,14 @@ bool tl_sdl_start(const tl_ga_config *cfg, const char *activity_class)
     /* The D-pad as buttons (DPAD_UP...), the way SDL maps them, rather than as the hat the gamepad layer sends by default. Read by the layer at the first controller update. */
     setenv("TL_PAD_DPAD", "keys", 0);
     static const tl_pad_sink sink = { pad_key, pad_motion };
-    if (!S.sdl2) tl_pad_set_sink(&sink);
+    /* SDL 2 since 2.0.14 takes pad buttons as onNativePadDown(device, keycode), as SDL 3 does; an older one (SuperTuxKart's) has another arity, and is left without. */
+    { bool st; if (!S.sdl2 || tl_dexidx_declares_method(SDLCTRL, "onNativePadDown", "(II)I", &st)) tl_pad_set_sink(&sink); }
     S.started = true;
     return true;
 }
+
+static char g_sdl_args[1024];
+void tl_sdl_set_arguments(const char *args) { snprintf(g_sdl_args, sizeof(g_sdl_args), "%s", args ? args : ""); }
 
 /* SDLMain: SDL_main runs on a thread of its own, started once the surface is ready. */
 static void *sdl_main_thread(void *arg)
@@ -735,10 +751,38 @@ static void *sdl_main_thread(void *arg)
     if (!run_main) return NULL;
     if (init_main) init_main(env, cls);
     tl_log_line("sdl: SDL_main starting");
-    int r = run_main(env, cls, tl_jni_new_string(S.main_lib[0] ? S.main_lib : "libmain.so"), tl_jni_new_string(S.main_fn[0] ? S.main_fn : "SDL_main"), tl_jni_new_obj_array(tl_jni_class("java/lang/String"), 0));
+    /* SDLActivity.getArguments(): what the player set as the game's launch arguments, split at spaces */
+    char args[sizeof(g_sdl_args)]; snprintf(args, sizeof(args), "%s", g_sdl_args);
+    const char *argv[64]; int argc = 0;
+    for (char *t = strtok(args, " "); t && argc < 64; t = strtok(NULL, " ")) argv[argc++] = t;
+    jobj *jargs = tl_jni_new_obj_array(tl_jni_class("java/lang/String"), (uint32_t)argc);
+    for (int i = 0; i < argc; i++) jargs->oarr.v[i] = tl_jni_new_string(argv[i]);
+    if (argc) tl_log_line("sdl: launch arguments: %s", g_sdl_args);
+    int r = run_main(env, cls, tl_jni_new_string(S.main_lib[0] ? S.main_lib : "libmain.so"), tl_jni_new_string(S.main_fn[0] ? S.main_fn : "SDL_main"), jargs);
     tl_log_line("sdl: SDL_main returned %d", r);
     if (cleanup) cleanup(env, cls);
     return NULL;
+}
+
+/* Some ports read the screen size from environment variables their Java activity sets from DisplayMetrics before SDL starts
+ * (Os.setenv("<NAME>_DISPLAY_WIDTH", ...)). No Java runs here, so a game asking for one finds nothing, falls back to a default
+ * render size and is stretched to the screen. Any such name in the DEX gets the real size. */
+typedef struct { int w, h, n; } display_env;
+
+static bool set_display_env(const char *str, void *ctx)
+{
+    display_env *d = ctx;
+    size_t n = strlen(str);
+    if (n < 15 || n > 64 || strspn(str, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") != n) return true;
+    int v = 0;
+    if (!strcmp(str + n - 14, "_DISPLAY_WIDTH")) v = d->w;
+    else if (n >= 16 && !strcmp(str + n - 15, "_DISPLAY_HEIGHT")) v = d->h;
+    else return true;
+    char num[16];
+    snprintf(num, sizeof(num), "%d", v);
+    setenv(str, num, 1);
+    tl_log_line("sdl: %s=%s (the activity would set it from DisplayMetrics)", str, num);
+    return ++d->n < 8;
 }
 
 static void *ui_main(void *arg)
@@ -808,6 +852,9 @@ static void *ui_main(void *arg)
      * the GL context it believes it saved, and with nothing saved there is nothing to put back. */
     tl_log_line("sdl: lifecycle delivered");
 
+    display_env de = { w, h, 0 };
+    tl_dexidx_each_string(set_display_env, &de);
+
     pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8u << 20);
     if (pthread_create(&S.sdl, &a, sdl_main_thread, NULL) != 0) tl_log_line("sdl: cannot start the SDL thread");
     pthread_attr_destroy(&a);
@@ -833,7 +880,8 @@ bool tl_sdl_run(void)
     return true;
 }
 
-unsigned long tl_sdl_frames(void) { return tl_egl_frames_presented(); }
+/* SDL games draw with GL or, through SDL_Vulkan, with Vulkan: frames presented by either. */
+unsigned long tl_sdl_frames(void) { return tl_egl_frames_presented() + tl_vk_frames_presented(); }
 
 /* Text and keys from the app's keyboard: SDLInputConnection.nativeCommitText for characters, onNativeKeyDown/Up for Backspace (67) and Enter (66). */
 void tl_sdl_commit_text(const char *utf8)

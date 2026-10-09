@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "husk-tl-bionic.h"
+#include "husk-tl-ld.h"
 
 void *tl_nwindow_native(void *window);
 int tl_nwindow_width(void *window);
@@ -65,6 +66,9 @@ void tl_vk_configure(const char *path, const char *frame_dir, int frame_every)
 static void vk_load(void)
 {
     V.trace = getenv("TL_VK_TRACE") ? 1 : 0;
+    /* One failed Metal command buffer (a GPU fault, or iOS cutting off a frame that kept the GPU too long) would otherwise lose the device for good, and a game
+     * has no way back from VK_ERROR_DEVICE_LOST: DXVK reports it as a removed device and the game ends itself. Read once, when MoltenVK first needs its settings. */
+    setenv("MVK_CONFIG_RESUME_LOST_DEVICE", "1", 0);
     V.lib = V.have_path ? dlopen(V.path, RTLD_NOW | RTLD_LOCAL) : RTLD_DEFAULT;
     V.gipa = V.lib ? (pfn_gipa)dlsym(V.lib, "vkGetInstanceProcAddr") : NULL;
     tl_log_line("vulkan: %s", V.gipa ? (V.have_path ? V.path : "MoltenVK linked into the process") : "MoltenVK not found");
@@ -84,6 +88,8 @@ static vk_ext_props *mvk_instance_exts(uint32_t *n)
 }
 
 /* The guest's list with Android's surface extension swapped for the Metal one and anything MoltenVK lacks dropped. */
+static void resolve_feature_hooks(void *instance);
+
 static int w_vkCreateInstance(const vk_instance_ci *ci, const void *alloc, void **out)
 {
     uint32_t nhave = 0;
@@ -113,6 +119,7 @@ static int w_vkCreateInstance(const vk_instance_ci *ci, const void *alloc, void 
     pfn_create_instance create = (pfn_create_instance)V.gipa(NULL, "vkCreateInstance");
     int r = create ? create(&copy, alloc, out) : -3;
     tl_log_line("vulkan: vkCreateInstance(%u extensions) -> %d", n, r);
+    if (r == VK_SUCCESS && out && *out) resolve_feature_hooks(*out);
     free(ext); free(have);
     return r;
 }
@@ -344,6 +351,288 @@ static int w_vkQueuePresentKHR(void *queue, const void *info)
     return r;
 }
 
+
+/* ------------------------------------------------------------ Direct3D 11 features over Metal */
+/*
+ * DXVK (Direct3D 9-11 over Vulkan) refuses a device that lacks any feature Direct3D 11 makes mandatory, and Metal has a few of them
+ * not at all: geometry shaders, cull distances, pipeline statistics queries, logic ops. A game that ships DXVK is told they are
+ * there, so it gets past adapter selection, and the device is then made without them. Most games never use them; one that does
+ * loses that draw rather than the whole game. Only for DXVK games: anything else is told the truth.
+ */
+#define VK_STYPE_FEATURES2 51
+enum { F_GEOMETRY = 4, F_LOGIC_OP = 8, F_PIPELINE_STATS = 24, F_CULL_DISTANCE = 38 };
+static const int k_d3d_features[] = { F_GEOMETRY, F_LOGIC_OP, F_PIPELINE_STATS, F_CULL_DISTANCE };
+#define N_FEATURES 55
+
+typedef void (*pfn_get_features)(void *, uint32_t *);
+typedef struct { uint32_t sType; void *pNext; uint32_t f[N_FEATURES]; } vk_features2;
+typedef void (*pfn_get_features2)(void *, vk_features2 *);
+static pfn_get_features2 g_real_gpdf2, g_real_gpdf2khr;
+typedef struct { uint32_t sType; const void *pNext; } vk_base;
+typedef struct {
+    uint32_t sType; const void *pNext; uint32_t flags; uint32_t queueCount; const void *queues;
+    uint32_t layerCount; const char *const *layers; uint32_t extCount; const char *const *exts; const uint32_t *features;
+} vk_device_ci;
+typedef int (*pfn_create_device)(void *, const vk_device_ci *, const void *, void **);
+
+static bool dxvk_game(void)
+{
+    static int known = -1;
+    if (known < 0) known = (tl_ld_find_lib("libdxvk_dxgi.so") || tl_ld_find_lib("libdxvk_d3d11.so") || tl_ld_find_lib("libdxvk_d3d9.so")) ? 1 : 0;
+    return known == 1;
+}
+
+static void claim(uint32_t *f)
+{
+    if (!dxvk_game()) return;
+    static atomic_int said;
+    for (size_t i = 0; i < sizeof(k_d3d_features) / sizeof(k_d3d_features[0]); i++) {
+        if (!f[k_d3d_features[i]] && !atomic_exchange(&said, 1)) tl_log_line("vulkan: DXVK game: reporting the Direct3D 11 features Metal lacks (geometry shaders, cull distance, pipeline statistics, logic op) as present");
+        f[k_d3d_features[i]] = 1;
+    }
+}
+
+
+/* Device extensions Direct3D 11 needs that MoltenVK does not offer, listed for DXVK games and taken out again before the device is made:
+ * the extension name, its feature struct's sType and how many VkBool32 it holds. */
+static const struct { const char *name; uint32_t stype; int bools; } k_fake_ext[] = {
+    { "VK_EXT_depth_clip_enable", 1000102000, 1 },     /* depthClipEnable: Metal clips depth unless clamping, which is what D3D asks by default */
+    { "VK_EXT_transform_feedback", 1000028000, 2 },    /* transformFeedback, geometryStreams: stream output, rarely used */
+    { "VK_EXT_custom_border_color", 1000287002, 2 },   /* customBorderColors, customBorderColorWithoutFormat: samplers fall back to the nearest standard border */
+};
+
+/* Single features inside structs MoltenVK does have, claimed the same way: the struct's sType and the VkBool32's index in it. */
+static const struct { uint32_t stype; int index; } k_fake_field[] = {
+    { 1000286000, 0 },   /* VK_EXT_robustness2 robustBufferAccess2: out-of-bounds buffer reads are not zeroed */
+    { 1000286000, 2 },   /* VK_EXT_robustness2 nullDescriptor: unbound slots are left unbound */
+};
+#define N_FAKE_FIELD (sizeof(k_fake_field) / sizeof(k_fake_field[0]))
+#define N_FAKE_EXT (sizeof(k_fake_ext) / sizeof(k_fake_ext[0]))
+
+typedef int (*pfn_enum_dev_ext)(void *, const char *, uint32_t *, vk_ext_props *);
+static pfn_enum_dev_ext g_real_enum_dev_ext;
+
+static bool real_dev_ext(void *pd, const char *name)
+{
+    uint32_t n = 0;
+    if (!g_real_enum_dev_ext || g_real_enum_dev_ext(pd, NULL, &n, NULL) != VK_SUCCESS) return false;
+    vk_ext_props *p = calloc(n + 1, sizeof(*p));
+    bool found = false;
+    if (g_real_enum_dev_ext(pd, NULL, &n, p) >= 0) for (uint32_t i = 0; i < n; i++) if (!strcmp(p[i].name, name)) { found = true; break; }
+    free(p);
+    return found;
+}
+
+static int w_vkEnumerateDeviceExtensionProperties(void *pd, const char *layer, uint32_t *count, vk_ext_props *props)
+{
+    if (!g_real_enum_dev_ext) return -3;
+    if (layer || !dxvk_game()) return g_real_enum_dev_ext(pd, layer, count, props);
+    uint32_t n = 0;
+    int r = g_real_enum_dev_ext(pd, NULL, &n, NULL);
+    if (r != VK_SUCCESS) return r;
+    vk_ext_props *all = calloc(n + N_FAKE_EXT + 1, sizeof(*all));
+    g_real_enum_dev_ext(pd, NULL, &n, all);
+    uint32_t total = n;
+    for (size_t i = 0; i < N_FAKE_EXT; i++) {
+        bool have = false;
+        for (uint32_t j = 0; j < n; j++) if (!strcmp(all[j].name, k_fake_ext[i].name)) have = true;
+        if (!have) { snprintf(all[total].name, sizeof(all[total].name), "%s", k_fake_ext[i].name); all[total].specVersion = 1; total++; }
+    }
+    if (!props) { *count = total; free(all); return VK_SUCCESS; }
+    uint32_t k = *count < total ? *count : total;
+    memcpy(props, all, k * sizeof(*all));
+    *count = k;
+    free(all);
+    return k < total ? VK_INCOMPLETE : VK_SUCCESS;
+}
+
+/* In a features query's chain, the fake extensions' structs say yes. */
+static void claim_chain(void *pd, vk_features2 *f)
+{
+    if (!dxvk_game()) return;
+    for (vk_base *b = (vk_base *)f->pNext; b; b = (vk_base *)b->pNext) {
+        for (size_t i = 0; i < N_FAKE_FIELD; i++)
+            if (b->sType == k_fake_field[i].stype) ((uint32_t *)((char *)b + sizeof(vk_base)))[k_fake_field[i].index] = 1;
+        for (size_t i = 0; i < N_FAKE_EXT; i++)
+            if (b->sType == k_fake_ext[i].stype && !real_dev_ext(pd, k_fake_ext[i].name)) {
+                uint32_t *bools = (uint32_t *)((char *)b + sizeof(vk_base));
+                for (int j = 0; j < k_fake_ext[i].bools; j++) bools[j] = 1;
+            }
+    }
+}
+
+/* What the device really has for each claimed field, asked once per struct type. */
+static bool real_field(void *pd, uint32_t stype, int index)
+{
+    if (!g_real_gpdf2) return false;
+    struct { uint32_t sType; void *pNext; uint32_t b[16]; } probe = { stype, NULL, { 0 } };
+    vk_features2 f = { VK_STYPE_FEATURES2, &probe };
+    g_real_gpdf2(pd, &f);
+    return probe.b[index] != 0;
+}
+
+static pfn_get_features g_real_gpdf;
+static void w_vkGetPhysicalDeviceFeatures(void *pd, uint32_t *f)
+{
+    if (g_real_gpdf) g_real_gpdf(pd, f);
+    claim(f);
+}
+
+static void w_vkGetPhysicalDeviceFeatures2(void *pd, vk_features2 *f) { if (g_real_gpdf2) g_real_gpdf2(pd, f); claim(f->f); claim_chain(pd, f); }
+static void w_vkGetPhysicalDeviceFeatures2KHR(void *pd, vk_features2 *f) { if (g_real_gpdf2khr) g_real_gpdf2khr(pd, f); else if (g_real_gpdf2) g_real_gpdf2(pd, f); claim(f->f); claim_chain(pd, f); }
+
+/* Turn off, in what the game enables, every claimed feature the device does not really have. */
+static void unclaim(void *pd, uint32_t *f, uint32_t *saved)
+{
+    uint32_t real[N_FEATURES];
+    if (g_real_gpdf) g_real_gpdf(pd, real); else memset(real, 0, sizeof(real));
+    for (size_t i = 0; i < sizeof(k_d3d_features) / sizeof(k_d3d_features[0]); i++) {
+        int k = k_d3d_features[i];
+        saved[i] = f[k];
+        if (!real[k]) f[k] = 0;
+    }
+}
+static void reclaim(uint32_t *f, const uint32_t *saved)
+{
+    for (size_t i = 0; i < sizeof(k_d3d_features) / sizeof(k_d3d_features[0]); i++) f[k_d3d_features[i]] = saved[i];
+}
+
+
+/* ------------------------------------------------------------ null descriptors */
+/*
+ * DXVK leaves unused vertex-buffer slots bound to VK_NULL_HANDLE, which robustness2's nullDescriptor allows and MoltenVK does not
+ * implement (it dereferences the buffer). For DXVK games each device gets one small buffer of zeros, bound in place of a null one:
+ * reads from it return zero, which is what a null binding reads.
+ */
+typedef struct { uint32_t sType; const void *pNext; uint32_t flags; uint64_t size; uint32_t usage; uint32_t sharing; uint32_t nq; const uint32_t *q; } vk_buffer_ci;
+typedef struct { uint64_t size, alignment; uint32_t typeBits; } vk_mem_req;
+typedef struct { uint32_t sType; const void *pNext; uint64_t size; uint32_t type; } vk_mem_ai;
+typedef struct { uint32_t flags, heap; } vk_mem_type;
+typedef struct { uint32_t typeCount; vk_mem_type types[32]; uint32_t heapCount; struct { uint64_t size; uint32_t flags; } heaps[16]; } vk_mem_props;
+#define NULL_BUF_SIZE (64 * 1024)
+
+static uint64_t g_null_buf;
+
+static void make_null_buffer(void *pd, void *dev)
+{
+    int (*create)(void *, const vk_buffer_ci *, const void *, uint64_t *) = dlsym(V.lib, "vkCreateBuffer");
+    void (*req)(void *, uint64_t, vk_mem_req *) = dlsym(V.lib, "vkGetBufferMemoryRequirements");
+    void (*props)(void *, vk_mem_props *) = dlsym(V.lib, "vkGetPhysicalDeviceMemoryProperties");
+    int (*alloc)(void *, const vk_mem_ai *, const void *, uint64_t *) = dlsym(V.lib, "vkAllocateMemory");
+    int (*bind)(void *, uint64_t, uint64_t, uint64_t) = dlsym(V.lib, "vkBindBufferMemory");
+    int (*map)(void *, uint64_t, uint64_t, uint64_t, uint32_t, void **) = dlsym(V.lib, "vkMapMemory");
+    if (!create || !req || !props || !alloc || !bind || !map) return;
+    vk_buffer_ci ci = { 12, NULL, 0, NULL_BUF_SIZE, 0x80 | 0x40 | 0x20 | 0x10 | 0x8 | 0x4 | 0x2 | 0x1, 0, 0, NULL };
+    uint64_t buf = 0, mem = 0;
+    if (create(dev, &ci, NULL, &buf) != VK_SUCCESS) return;
+    vk_mem_req r; req(dev, buf, &r);
+    vk_mem_props mp; memset(&mp, 0, sizeof(mp)); props(pd, &mp);
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < mp.typeCount && i < 32; i++) if ((r.typeBits & (1u << i)) && (mp.types[i].flags & 0x6) == 0x6) { type = i; break; }
+    if (type == UINT32_MAX) return;
+    vk_mem_ai ai = { 5, NULL, r.size, type };
+    void *ptr = NULL;
+    if (alloc(dev, &ai, NULL, &mem) != VK_SUCCESS || bind(dev, buf, mem, 0) != VK_SUCCESS || map(dev, mem, 0, r.size, 0, &ptr) != VK_SUCCESS) return;
+    memset(ptr, 0, (size_t)r.size);
+    g_null_buf = buf;
+    tl_log_line("vulkan: DXVK game: a %d KiB buffer of zeros stands in for null vertex buffers", NULL_BUF_SIZE / 1024);
+}
+
+typedef void (*pfn_bind_vb)(void *, uint32_t, uint32_t, const uint64_t *, const uint64_t *);
+typedef void (*pfn_bind_vb2)(void *, uint32_t, uint32_t, const uint64_t *, const uint64_t *, const uint64_t *, const uint64_t *);
+static pfn_bind_vb g_real_bind_vb;
+static pfn_bind_vb2 g_real_bind_vb2, g_real_bind_vb2ext;
+
+static void resolve_binds(void)
+{
+    if (g_real_bind_vb) return;
+    g_real_bind_vb2 = (pfn_bind_vb2)dlsym(V.lib, "vkCmdBindVertexBuffers2");
+    g_real_bind_vb2ext = (pfn_bind_vb2)dlsym(V.lib, "vkCmdBindVertexBuffers2EXT");
+    g_real_bind_vb = (pfn_bind_vb)dlsym(V.lib, "vkCmdBindVertexBuffers");
+}
+
+static bool has_null(uint32_t n, const uint64_t *b) { if (!g_null_buf || !b) return false; for (uint32_t i = 0; i < n; i++) if (!b[i]) return true; return false; }
+
+static void w_vkCmdBindVertexBuffers(void *cmd, uint32_t first, uint32_t n, const uint64_t *bufs, const uint64_t *offs)
+{
+    resolve_binds();
+    if (!has_null(n, bufs) || n > 64) { g_real_bind_vb(cmd, first, n, bufs, offs); return; }
+    uint64_t b[64], o[64];
+    for (uint32_t i = 0; i < n; i++) { b[i] = bufs[i] ? bufs[i] : g_null_buf; o[i] = bufs[i] ? offs[i] : 0; }
+    g_real_bind_vb(cmd, first, n, b, o);
+}
+
+static void bind_vb2(pfn_bind_vb2 real, void *cmd, uint32_t first, uint32_t n, const uint64_t *bufs, const uint64_t *offs, const uint64_t *sizes, const uint64_t *strides)
+{
+    if (!has_null(n, bufs) || n > 64) { real(cmd, first, n, bufs, offs, sizes, strides); return; }
+    uint64_t b[64], o[64], z[64];
+    for (uint32_t i = 0; i < n; i++) {
+        b[i] = bufs[i] ? bufs[i] : g_null_buf; o[i] = bufs[i] ? offs[i] : 0;
+        if (sizes) z[i] = bufs[i] ? sizes[i] : NULL_BUF_SIZE;
+    }
+    real(cmd, first, n, b, o, sizes ? z : NULL, strides);
+}
+static void w_vkCmdBindVertexBuffers2(void *cmd, uint32_t first, uint32_t n, const uint64_t *b, const uint64_t *o, const uint64_t *z, const uint64_t *s) { resolve_binds(); bind_vb2(g_real_bind_vb2, cmd, first, n, b, o, z, s); }
+static void w_vkCmdBindVertexBuffers2EXT(void *cmd, uint32_t first, uint32_t n, const uint64_t *b, const uint64_t *o, const uint64_t *z, const uint64_t *s) { resolve_binds(); bind_vb2(g_real_bind_vb2ext ? g_real_bind_vb2ext : g_real_bind_vb2, cmd, first, n, b, o, z, s); }
+
+static pfn_create_device g_real_create_device;
+static int w_vkCreateDevice(void *pd, const vk_device_ci *ci, const void *alloc, void **out)
+{
+    if (!g_real_create_device) return -3;
+    if (!dxvk_game()) return g_real_create_device(pd, ci, alloc, out);
+    uint32_t base[N_FEATURES], saved1[8], saved2[8];
+    vk_device_ci copy = *ci;
+    if (ci->features) { memcpy(base, ci->features, sizeof(base)); unclaim(pd, base, saved1); copy.features = base; }
+    /* features may also come as a VkPhysicalDeviceFeatures2 in the chain; it is the game's memory, so edit it for the call and put it back */
+    vk_features2 *f2 = NULL;
+    for (const vk_base *b = ci->pNext; b; b = b->pNext) if (b->sType == VK_STYPE_FEATURES2) { f2 = (vk_features2 *)b; break; }
+    if (f2) unclaim(pd, f2->f, saved2);
+    /* the fake extensions out of the list, and their structs out of the chain (relinked for the call, restored after) */
+    const char **ext = calloc(ci->extCount + 1, sizeof(char *));
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < ci->extCount; i++) {
+        bool fake = false;
+        for (size_t j = 0; j < N_FAKE_EXT; j++) if (!strcmp(ci->exts[i], k_fake_ext[j].name) && !real_dev_ext(pd, k_fake_ext[j].name)) fake = true;
+        if (fake) tl_log_line("vulkan: device extension %s was only claimed; left out", ci->exts[i]); else ext[n++] = ci->exts[i];
+    }
+    copy.extCount = n; copy.exts = ext;
+    /* claimed fields the device lacks, off for the call */
+    struct { uint32_t *at; uint32_t was; } off[16]; int noff = 0;
+    for (vk_base *b = (vk_base *)copy.pNext; b; b = (vk_base *)b->pNext)
+        for (size_t j = 0; j < N_FAKE_FIELD; j++)
+            if (b->sType == k_fake_field[j].stype && noff < 16) {
+                uint32_t *at = (uint32_t *)((char *)b + sizeof(vk_base)) + k_fake_field[j].index;
+                if (*at && !real_field(pd, k_fake_field[j].stype, k_fake_field[j].index)) { off[noff].at = at; off[noff].was = *at; noff++; *at = 0; }
+            }
+    struct { vk_base *prev; const void *was; } cut[16]; int ncut = 0;
+    vk_base *prev = (vk_base *)&copy;
+    for (vk_base *b = (vk_base *)copy.pNext; b; b = (vk_base *)b->pNext) {
+        bool fake = false;
+        for (size_t j = 0; j < N_FAKE_EXT; j++) if (b->sType == k_fake_ext[j].stype && !real_dev_ext(pd, k_fake_ext[j].name)) fake = true;
+        if (fake && ncut < 16) { cut[ncut].prev = prev; cut[ncut].was = prev->pNext; ncut++; prev->pNext = b->pNext; continue; }
+        prev = b;
+    }
+    int r = g_real_create_device(pd, &copy, alloc, out);
+    for (int i = ncut - 1; i >= 0; i--) cut[i].prev->pNext = cut[i].was;
+    for (int i = 0; i < noff; i++) *off[i].at = off[i].was;
+    free(ext);
+    if (f2) reclaim(f2->f, saved2);
+    tl_log_line("vulkan: vkCreateDevice(%u extensions) -> %d", ci->extCount, r);
+    if (r == VK_SUCCESS && out && *out) {
+        make_null_buffer(pd, *out);
+    }
+    return r;
+}
+
+static void resolve_feature_hooks(void *instance)
+{
+    if (!g_real_gpdf) g_real_gpdf = (pfn_get_features)V.gipa(instance, "vkGetPhysicalDeviceFeatures");
+    if (!g_real_gpdf2) g_real_gpdf2 = (pfn_get_features2)V.gipa(instance, "vkGetPhysicalDeviceFeatures2");
+    if (!g_real_gpdf2khr) g_real_gpdf2khr = (pfn_get_features2)V.gipa(instance, "vkGetPhysicalDeviceFeatures2KHR");
+    if (!g_real_create_device) g_real_create_device = (pfn_create_device)V.gipa(instance, "vkCreateDevice");
+    if (!g_real_enum_dev_ext) g_real_enum_dev_ext = (pfn_enum_dev_ext)V.gipa(instance, "vkEnumerateDeviceExtensionProperties");
+}
+
 static void *w_vkGetInstanceProcAddr(void *instance, const char *name);
 static void *w_vkGetDeviceProcAddr(void *device, const char *name);
 
@@ -356,6 +645,14 @@ static const struct { const char *name; void *fn; } k_over[] = {
     { "vkQueuePresentKHR", w_vkQueuePresentKHR },
     { "vkCreateSwapchainKHR", w_vkCreateSwapchainKHR },
     { "vkAcquireNextImageKHR", w_vkAcquireNextImageKHR },
+    { "vkGetPhysicalDeviceFeatures", w_vkGetPhysicalDeviceFeatures },
+    { "vkGetPhysicalDeviceFeatures2", w_vkGetPhysicalDeviceFeatures2 },
+    { "vkGetPhysicalDeviceFeatures2KHR", w_vkGetPhysicalDeviceFeatures2KHR },
+    { "vkCreateDevice", w_vkCreateDevice },
+    { "vkEnumerateDeviceExtensionProperties", w_vkEnumerateDeviceExtensionProperties },
+    { "vkCmdBindVertexBuffers", w_vkCmdBindVertexBuffers },
+    { "vkCmdBindVertexBuffers2", w_vkCmdBindVertexBuffers2 },
+    { "vkCmdBindVertexBuffers2EXT", w_vkCmdBindVertexBuffers2EXT },
 };
 
 static void *overridden(const char *name)
@@ -367,6 +664,7 @@ static void *overridden(const char *name)
 static void *w_vkGetInstanceProcAddr(void *instance, const char *name)
 {
     if (!name || !vk_ready()) return NULL;
+    if (instance) resolve_feature_hooks(instance);
     void *fn = overridden(name);
     if (fn) return fn;
     fn = V.gipa(instance, name);

@@ -220,6 +220,35 @@ static void MA_broadcastAddresses(tl_jcall *c) { const char *a[] = { "192.168.1.
 static void MA_userInputStatus(tl_jcall *c) { c->ret = vi(-1); }                 /* no dialog is open */
 static void MA_userInputString(tl_jcall *c) { const char *a[] = { "" }; c->ret = vl(string_array(a, 1)); }
 static void MA_keyboardHeight(tl_jcall *c) { c->ret = vf(0.f); }
+
+/* GameTextInput: the field's state, the keyboard's visibility and the field's Return action, for the iPhone's keyboard
+ * (husk-tl-gameactivity.c does the typing). */
+static void GTI_setState(tl_jcall *c)
+{
+    jobj *st = c->args[0].l;
+    if (!st) return;
+    jvalue t = tl_jni_get_field(st, "text", "Ljava/lang/String;");
+    tl_ga_text_state(tl_jni_string(t.l), tl_jni_get_field(st, "selectionStart", "I").i, tl_jni_get_field(st, "selectionEnd", "I").i);
+}
+/* GameTextInput makes the field's Java string from UTF-8 bytes: Charset.forName("UTF-8").decode(ByteBuffer).toString(). */
+static void CS_forName(tl_jcall *c) { c->ret = vl(tl_jni_new_object(tl_jni_class("java/nio/charset/Charset"))); }
+static void CS_decode(tl_jcall *c)
+{
+    jobj *buf = c->args[0].l, *cb = tl_jni_new_object(tl_jni_class("java/nio/CharBuffer"));
+    const char *p = buf ? tl_jni_get_field(buf, "address", "J").l : NULL;
+    int64_t n = buf ? tl_jni_get_field(buf, "capacity", "J").j : 0;
+    char tmp[16384];
+    if (n < 0) n = 0;
+    if (n > (int64_t)sizeof(tmp) - 1) n = sizeof(tmp) - 1;
+    if (p && n) memcpy(tmp, p, (size_t)n);
+    tmp[n] = 0;
+    jvalue v; v.j = 0; v.l = tl_jni_new_string(tmp);
+    tl_jni_set_field(cb, "str", "Ljava/lang/String;", v);
+    c->ret = vl(cb);
+}
+static void CB_toString(tl_jcall *c) { c->ret = tl_jni_get_field(c->self, "str", "Ljava/lang/String;"); }
+static void GTI_keyboard(tl_jcall *c) { tl_ga_keyboard(c->args[0].z != 0); }
+static void GTI_imeFields(tl_jcall *c) { tl_ga_ime_options(c->args[2].i); }
 void (*tl_cocos_open_url_hook_mc)(const char *url);
 static void MA_launchUri(tl_jcall *c) { tl_log_line("minecraft: launchUri %s", S(c->args[0].l)); if (tl_cocos_open_url_hook_mc) tl_cocos_open_url_hook_mc(S(c->args[0].l)); }
 static void MA_quit(tl_jcall *c) { (void)c; tl_log_line("minecraft: the game asked to quit"); if (tl_guest_exit_hook) tl_guest_exit_hook(0); }
@@ -387,6 +416,7 @@ static const struct { const char *name, *super; } k_classes[] = {
     { "com/mojang/minecraftpe/store/ExtraLicenseResponseData", "java/lang/Object" }, { "com/mojang/minecraftpe/store/NativeStoreListener", "java/lang/Object" },
     { "com/mojang/minecraftpe/store/Product", "java/lang/Object" }, { "com/mojang/minecraftpe/store/Purchase", "java/lang/Object" },
     { "com/google/androidgamesdk/gametextinput/InputConnection", "java/lang/Object" }, { "com/google/androidgamesdk/gametextinput/State", "java/lang/Object" },
+    { "java/nio/charset/Charset", "java/lang/Object" }, { "java/nio/CharBuffer", "java/lang/Object" },
     { "java/lang/ClassNotFoundException", "java/lang/Exception" }, { "android/os/LocaleList", "java/lang/Object" }, { "com/microsoft/xal/androidjava/DeviceInfo", "java/lang/Object" }, { "com/microsoft/xal/androidjava/Storage", "java/lang/Object" },
     { "com/microsoft/xal/crypto/SecureRandom", "java/lang/Object" }, { "com/microsoft/xbox/idp/interop/Interop", "java/lang/Object" },
     { "com/microsoft/xboxlive/LocalStorage", "java/lang/Object" }, { "com/microsoft/playfab/utilities/multiplayer/AndroidJniHelperMultiplayer", "java/lang/Object" },
@@ -489,8 +519,12 @@ static const tl_jhle k_hle[] = {
     M_("com/microsoft/xbox/idp/interop/Interop", "getLocale", "()Ljava/lang/String;", XAL_locale),
     M_("com/microsoft/xboxlive/LocalStorage", "getPath", "(Landroid/content/Context;)Ljava/lang/String;", XAL_storagePath),
     M_("com/microsoft/playfab/utilities/multiplayer/AndroidJniHelperMultiplayer", "createUUID", "()Ljava/lang/String;", Playfab_uuid),
-    M_("com/google/androidgamesdk/gametextinput/InputConnection", "setState", "(Lcom/google/androidgamesdk/gametextinput/State;)V", Noop),
-    M_("com/google/androidgamesdk/gametextinput/InputConnection", "setSoftKeyboardActive", "(ZI)V", Noop),
+    M_("com/google/androidgamesdk/gametextinput/InputConnection", "setState", "(Lcom/google/androidgamesdk/gametextinput/State;)V", GTI_setState),
+    M_("java/nio/charset/Charset", "forName", "(Ljava/lang/String;)Ljava/nio/charset/Charset;", CS_forName),
+    M_("java/nio/charset/Charset", "decode", "(Ljava/nio/ByteBuffer;)Ljava/nio/CharBuffer;", CS_decode),
+    M_("java/nio/CharBuffer", "toString", "()Ljava/lang/String;", CB_toString),
+    M_("com/google/androidgamesdk/GameActivity", "setTextInputState", "(Lcom/google/androidgamesdk/gametextinput/State;)V", GTI_setState),
+    M_("com/google/androidgamesdk/gametextinput/InputConnection", "setSoftKeyboardActive", "(ZI)V", GTI_keyboard),
     M_("com/google/androidgamesdk/gametextinput/InputConnection", "restartInput", "()V", Noop),
     M_("java/lang/ClassLoader", "findClass", "(Ljava/lang/String;)Ljava/lang/Class;", CL_findClass),
     M_("java/lang/ClassLoader", "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", CL_findClass),
@@ -499,7 +533,7 @@ static const tl_jhle k_hle[] = {
     M_("java/util/Locale", "getScript", "()Ljava/lang/String;", Locale_script), M_("java/util/Locale", "getVariant", "()Ljava/lang/String;", Locale_variant),
     M_("com/google/androidgamesdk/GameActivity", "finish", "()V", MA_quit),
     M_("com/google/androidgamesdk/GameActivity", "setWindowFlags", "(II)V", Noop),
-    M_("com/google/androidgamesdk/GameActivity", "setImeEditorInfoFields", "(III)V", Noop),
+    M_("com/google/androidgamesdk/GameActivity", "setImeEditorInfoFields", "(III)V", GTI_imeFields),
     { NULL, NULL, NULL, NULL }
 };
 

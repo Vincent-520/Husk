@@ -48,6 +48,7 @@ bool husk_ios_jit_is_available(void);
 /* Whether a plain MAP_JIT mapping executes in this process -- the second of the
  * two routes to executable memory, measured rather than predicted. */
 bool husk_ios_jit_mapjit_works(void);
+const char *husk_ios_jit_self_route(void);
 void husk_ios_jit_detach(void);
 void husk_ios_jit_log_footprint(const char *tag);
 size_t husk_ios_available_memory(void);

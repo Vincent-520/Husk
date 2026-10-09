@@ -54,6 +54,22 @@ enum ApkMetadata {
         return info
     }
 
+    /// The app's package name (`com.example.game`), from the manifest's root element.
+    static func packageName(_ manifest: Data) -> String? {
+        guard let root = elements(manifest).first(where: { $0.name == "manifest" }),
+              let value = root.attributes.first(where: { $0.name == "package" })?.value,
+              !value.isEmpty, value.count < 200 else { return nil }
+        return value
+    }
+
+    /// The app's versionCode, from the manifest's root element (an integer attribute).
+    static func versionCode(_ manifest: Data) -> Int? {
+        guard let root = elements(manifest).first(where: { $0.name == "manifest" }),
+              let attr = root.attributes.first(where: { $0.name == "versionCode" }),
+              attr.dataType == 0x10 || attr.dataType == 0x11 else { return nil }
+        return Int(attr.data)
+    }
+
     /// A label that could plausibly be shown to someone. A mis-parse produces
     /// control characters or a hundred lines of XML, not a name.
     private static func clean(_ text: String?) -> String? {
@@ -83,6 +99,40 @@ enum ApkMetadata {
             }
         }
         return background
+    }
+
+    /// An adaptive icon's two layers: the foreground drawable, and what is behind it -- another drawable, or a
+    /// plain colour (given outright, or as a reference to a colour resource).
+    struct AdaptiveLayers {
+        var foreground: UInt32?
+        var background: UInt32?
+        var backgroundColor: UInt32?
+    }
+
+    static func adaptiveLayers(_ xml: Data) -> AdaptiveLayers {
+        var layers = AdaptiveLayers()
+        for element in elements(xml) {
+            guard element.name == "foreground" || element.name == "background" else { continue }
+            for attr in element.attributes where attr.name == "drawable" {
+                let fore = element.name == "foreground"
+                if attr.dataType == 0x01 {                                   // TYPE_REFERENCE
+                    if fore { layers.foreground = layers.foreground ?? attr.data } else { layers.background = layers.background ?? attr.data }
+                } else if !fore, (0x1c...0x1f).contains(attr.dataType) {     // TYPE_INT_COLOR_*
+                    layers.backgroundColor = colorARGB(attr.dataType, attr.data)
+                }
+            }
+        }
+        return layers
+    }
+
+    /// A colour resource's value as 0xAARRGGBB, preferring the default configuration.
+    static func color(for id: UInt32, resources: Data) -> UInt32? {
+        ResourceTable(resources)?.color(for: id)
+    }
+
+    fileprivate static func colorARGB(_ type: UInt8, _ data: UInt32) -> UInt32 {
+        // The RGB forms have no alpha of their own: opaque.
+        type == 0x1d || type == 0x1f ? data | 0xFF00_0000 : data
     }
 
     // MARK: - AndroidManifest.xml
@@ -287,6 +337,16 @@ private final class ResourceTable {
         return nil
     }
 
+
+    /// A colour resource's value, following one reference to another colour if that is what it holds.
+    func color(for id: UInt32, depth: Int = 0) -> UInt32? {
+        let found = entries(for: id)
+        let best = found.first { $0.density == 0 && $0.locale == 0 } ?? found.first
+        guard let best else { return nil }
+        if (0x1c...0x1f).contains(best.dataType) { return ApkMetadata.colorARGB(best.dataType, best.data) }
+        if best.dataType == 0x01, depth < 4 { return color(for: best.data, depth: depth + 1) }
+        return nil
+    }
 
     private struct Entry {
         let dataType: UInt8

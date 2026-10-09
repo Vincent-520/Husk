@@ -233,11 +233,18 @@ final class GuestImage: ObservableObject {
             }
         }
 
-        if !haveImage || installedImageDigest != m.image.sha256 {
+        // Not downloaded is not out of date: someone who only plays games in the Translation Layer never asked for Android,
+        // and the Android page's Download button is where it starts.
+        guard haveImage else {
+            HuskLog.log("guest", "no Android image installed; not offering an update")
+            update = .none
+            return
+        }
+        if installedImageDigest != m.image.sha256 {
             HuskLog.log("guest", "image differs: have "
                       + "\(installedImageDigest?.prefix(12) ?? "nothing"), "
                       + "release has \(m.image.sha256.prefix(12))")
-            update = .image(bytes: m.image.size + m.snapshot.size)
+            offer(.image(bytes: m.image.size + m.snapshot.size), release: m.image.sha256)
             return
         }
         if Self.wantsSnapshot,
@@ -245,11 +252,31 @@ final class GuestImage: ObservableObject {
             HuskLog.log("guest", "snapshot differs: have "
                       + "\(installedSnapshotDigest?.prefix(12) ?? "nothing"), "
                       + "release has \(m.snapshot.sha256.prefix(12))")
-            update = .snapshot(bytes: m.snapshot.size)
+            offer(.snapshot(bytes: m.snapshot.size), release: m.snapshot.sha256)
             return
         }
         HuskLog.log("guest", "guest is up to date with \(m.generation)")
         update = .none
+    }
+
+    /// Settings > Saved machine: whether to ask at all.
+    nonisolated static let askUpdatesKey = "husk.guest.askUpdates"
+    private static let declinedKey = "husk.guest.updateDeclined"
+    private var offered: String?
+
+    /// Ask about a release once: not when asking is turned off, and not again after "Not now" for that same release.
+    private func offer(_ u: GuestUpdate, release digest: String) {
+        let d = UserDefaults.standard
+        guard d.object(forKey: Self.askUpdatesKey) as? Bool ?? true else {
+            HuskLog.log("guest", "update prompts are off; not asking")
+            return
+        }
+        guard d.string(forKey: Self.declinedKey) != digest else {
+            HuskLog.log("guest", "this release was declined before; not asking again")
+            return
+        }
+        offered = digest
+        update = u
     }
 
     /// Take whatever the update prompt offered.
@@ -261,7 +288,10 @@ final class GuestImage: ObservableObject {
         }
     }
 
-    func dismissUpdate() { update = .none }
+    func dismissUpdate() {
+        if update.isSomething, let offered { UserDefaults.standard.set(offered, forKey: Self.declinedKey) }
+        update = .none
+    }
 
     nonisolated var userdataPath: String { documents.appendingPathComponent("lineage-vdb.qcow2").path }
     nonisolated var varsPath: String { documents.appendingPathComponent("lineage-efi-vars.fd").path }

@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include "husk-tl-framework.h"
+#include "husk-tl-sound.h"
 #include "husk-tl-res.h"
 #include "husk-tl-blit.h"
 #include "husk-tl-prefs.h"
@@ -9,6 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
+void tl_log_line(const char *fmt, ...);
 
 #if defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
@@ -929,14 +932,13 @@ static bool matrix_setScale(tl_dex_context *ctx, tl_dex_object *this_obj, tl_dex
 }
 
 /*
- * Audio, for now silent.
+ * Audio: android.media.SoundPool.
  *
  * SoundPool is built through two builders chained off each other, so every setter
  * has to hand back the builder it was called on -- a null there ends the chain
- * and the game ends up with no pool and a crash on its first sound. The pool
- * itself plays nothing yet; load() returns distinct ids so the game's own
- * bookkeeping stays coherent. Real audio is a separate piece of work and the
- * game does not depend on it to run.
+ * and the game ends up with no pool and a crash on its first sound. load() decodes
+ * the sound the resource id names and play() mixes it to the speakers
+ * (husk-tl-sound.c).
  */
 static bool return_this(tl_dex_context *ctx, tl_dex_object *this_obj, tl_dex_val *args, int nargs, tl_dex_val *ret)
 { (void)ctx; (void)args; (void)nargs; if (ret) { ret->raw64 = 0; ret->l = this_obj; } return true; }
@@ -951,11 +953,45 @@ static bool soundpool_build(tl_dex_context *ctx, tl_dex_object *this_obj, tl_dex
     return true;
 }
 
+/* load(Context, int resId, int priority): the sound file the id names, read from the APK and decoded (husk-tl-sound.c). */
 static bool soundpool_load(tl_dex_context *ctx, tl_dex_object *this_obj, tl_dex_val *args, int nargs, tl_dex_val *ret)
 {
-    (void)ctx; (void)this_obj; (void)args; (void)nargs;
-    static int next_sound_id = 1;
-    RET_INT(next_sound_id++);
+    (void)this_obj;
+    int id = 0;
+    uint32_t res_id = nargs > 2 ? args[2].raw32 : 0;
+    tl_res *res = framework_res(ctx);
+    const char *entry = (res && res_id) ? tl_res_file(res, res_id, TL_FRAMEWORK_DENSITY_DPI) : NULL;
+    if (entry && ctx->apk_path) {
+        tl_zip z;
+        char err[128] = {0};
+        if (tl_zip_open(&z, ctx->apk_path, err, sizeof(err))) {
+            const tl_zip_entry *e = tl_zip_find(&z, entry);
+            const uint8_t *data = NULL; size_t len = 0; bool owned = false;
+            if (e && tl_zip_data(&z, e, 16u << 20, &data, &len, &owned, err, sizeof(err))) {
+                id = tl_sound_load(data, len);
+                if (owned) free((void *)data);
+            }
+            tl_zip_close(&z);
+        }
+    }
+    if (!id) tl_log_line("sound: no sound for resource 0x%08x (%s)", res_id, entry ? entry : "not in the table");
+    RET_INT(id);
+    return true;
+}
+
+/* play(int soundID, float left, float right, int priority, int loop, float rate) -> streamID */
+static bool soundpool_play(tl_dex_context *ctx, tl_dex_object *this_obj, tl_dex_val *args, int nargs, tl_dex_val *ret)
+{
+    (void)ctx; (void)this_obj;
+    int stream = nargs > 6 ? tl_sound_play(args[1].i, args[2].f, args[3].f, args[5].i, args[6].f) : 0;
+    RET_INT(stream);
+    return true;
+}
+
+static bool soundpool_stop(tl_dex_context *ctx, tl_dex_object *this_obj, tl_dex_val *args, int nargs, tl_dex_val *ret)
+{
+    (void)ctx; (void)this_obj; (void)ret;
+    if (nargs > 1) tl_sound_stop(args[1].i);
     return true;
 }
 
@@ -2419,8 +2455,8 @@ static const tl_native_entry s_native_methods[] = {
     { "Landroid/media/SoundPool$Builder;", "setAudioAttributes", NULL, return_this },
     { "Landroid/media/SoundPool$Builder;", "build", NULL, soundpool_build },
     { "Landroid/media/SoundPool;", "load", NULL, soundpool_load },
-    { "Landroid/media/SoundPool;", "play", NULL, noop_stub },
-    { "Landroid/media/SoundPool;", "stop", NULL, noop_stub },
+    { "Landroid/media/SoundPool;", "play", NULL, soundpool_play },
+    { "Landroid/media/SoundPool;", "stop", NULL, soundpool_stop },
     { "Landroid/media/SoundPool;", "pause", NULL, noop_stub },
     { "Landroid/media/SoundPool;", "release", NULL, noop_stub },
     { "Ljava/util/Random;", "<init>", NULL, random_init },

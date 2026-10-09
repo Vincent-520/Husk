@@ -1,5 +1,5 @@
 #!/bin/bash
-# Husk: build everything from a clean checkout to an unsigned IPA, in order.
+# Husk: build everything from a clean checkout to the IPA, in order.
 #
 # Runs on macOS with Xcode. Usage: ./scripts/ci_build.sh [output.ipa]
 set -euo pipefail
@@ -43,9 +43,15 @@ step "integrate Husk sources into QEMU, then rebuild it"
 step "guest kernel + firmware"
 ./scripts/fetch_phase0_guest.sh
 
+if [ ! -d build/ios-arm64/lib/MoltenVK.xcframework ]; then
+    step "MoltenVK (Vulkan over Metal, for Unreal Engine games)"
+    ./scripts/build_moltenvk_ios.sh
+fi
+
 step "on-device pairing (Rust)"
 ./scripts/build_rppairing_ios.sh
 
 step "app + IPA"
 mkdir -p "$(dirname "$OUT")"
 ./scripts/package_ipa.sh "$OUT"
+./scripts/package_ipa.sh --trollstore "${OUT%.ipa}.tipa"

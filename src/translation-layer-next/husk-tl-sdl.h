@@ -23,6 +23,8 @@ bool tl_sdl_start(const tl_ga_config *cfg, const char *activity_class);
 
 /* Another APK of the same app (a split, an asset pack): its libraries and assets are found along with the main one's. Call before tl_sdl_start. */
 bool tl_sdl_add_package(const char *apk_path);
+/* Launch arguments for the game (what SDLActivity.getArguments() returns), space-separated. Before tl_sdl_start. */
+void tl_sdl_set_arguments(const char *args);
 
 /* The surface and its lifecycle, then SDL_main on its own thread: the game takes it from there. */
 bool tl_sdl_run(void);

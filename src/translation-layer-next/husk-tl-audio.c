@@ -76,8 +76,40 @@ static void sleep_for(int frames, int rate)
     nanosleep(&ts, NULL);
 }
 
-/* The mixer's write: copy into the ring, blocking while it is full (that is the pacing). */
+static void ring_write(const int16_t *samples, int frames, int channels, int rate);
+
+/*
+ * The mixer's write. A game mixing at a low rate (Unity's FMOD runs at 24 kHz) is played at twice that: each frame, then the
+ * point halfway to the next. The iPhone played Subway Surfers' 24 kHz output high-pitched and broken while the same samples
+ * were right on a Mac, and every game that sounds right there runs at 44.1 or 48 kHz -- so the queue is only ever opened
+ * at one of those.
+ */
 static void host_write(const int16_t *samples, int frames, int channels, int rate)
+{
+    if (rate > 0 && rate * 2 <= 48000 && channels > 0 && channels <= 2 && frames > 0) {
+        static int16_t prev[2];
+        static bool have_prev;
+        int16_t *up = malloc((size_t)frames * 2 * (size_t)channels * sizeof(int16_t));
+        if (up) {
+            for (int f = 0; f < frames; f++)
+                for (int c = 0; c < channels; c++) {
+                    int16_t cur = samples[(size_t)f * channels + c];
+                    int16_t before = f > 0 ? samples[(size_t)(f - 1) * channels + c] : (have_prev ? prev[c] : cur);
+                    up[(size_t)(2 * f) * channels + c] = (int16_t)(((int)before + cur) / 2);
+                    up[(size_t)(2 * f + 1) * channels + c] = cur;
+                }
+            for (int c = 0; c < channels; c++) prev[c] = samples[(size_t)(frames - 1) * channels + c];
+            have_prev = true;
+            ring_write(up, frames * 2, channels, rate * 2);
+            free(up);
+            return;
+        }
+    }
+    ring_write(samples, frames, channels, rate);
+}
+
+/* Copy into the ring, blocking while it is full (that is the pacing). */
+static void ring_write(const int16_t *samples, int frames, int channels, int rate)
 {
     pthread_mutex_lock(&A.mu);
     if (!A.q && !A.failed) { if (!open_queue(rate, channels)) A.failed = true; }
@@ -95,10 +127,25 @@ static void host_write(const int16_t *samples, int frames, int channels, int rat
     pthread_mutex_unlock(&A.mu);
 }
 
-/* TL_AUDIO_MUTE: pace like a device but make no sound (for test runs on a Mac). */
+/* TL_AUDIO_MUTE: pace like a device but make no sound (for test runs on a Mac). TL_AUDIO_STATS=1 also logs, about once a second,
+ * how loud the game's output was, so a silent run still shows whether the game is making sound. */
 static void muted_write(const int16_t *samples, int frames, int channels, int rate)
 {
-    (void)samples; (void)channels;
+    static int stats = -1, seen, peak;
+    static long loud, total;
+    if (stats < 0) stats = getenv("TL_AUDIO_STATS") != NULL;
+    if (stats) {
+        for (int i = 0; i < frames * channels; i++) {
+            int v = samples[i] < 0 ? -samples[i] : samples[i];
+            if (v > peak) peak = v;
+            if (v > 64) loud++;
+        }
+        total += frames * channels;
+        if ((seen += frames) >= rate) {
+            tl_log_line("audio: %d Hz x %d, peak %d, %.0f%% of samples audible", rate, channels, peak, 100.0 * loud / (total ? total : 1));
+            seen = 0; peak = 0; loud = 0; total = 0;
+        }
+    }
     sleep_for(frames, rate);
 }
 

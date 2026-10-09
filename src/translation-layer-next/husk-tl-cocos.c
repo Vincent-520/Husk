@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #define _DARWIN_C_SOURCE
 #include "husk-tl-cocos.h"
+#include "husk-tl-geode.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -108,7 +109,10 @@ bool tl_cocos_start(const tl_cocos_config *cfg)
     if (!setapk) return false;
     setapk(tl_jni_env(), tl_jni_class_object("org/cocos2dx/lib/Cocos2dxHelper"), tl_jni_new_string(cfg->apk_path));
     tl_log_line("cocos: nativeSetApkPath done");
-    return !tl_jni_pending();
+    if (tl_jni_pending()) return false;
+    /* Geode, when asked for: last, as its launcher does, so the game is set up when it hooks in. */
+    if (tl_geode_configured() && !tl_geode_load(tl_hle_activity())) tl_log_line("cocos: Geode did not load; the game starts without it");
+    return true;
 }
 
 /* ------------------------------------------------------------- text bitmaps */

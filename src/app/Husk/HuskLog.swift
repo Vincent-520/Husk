@@ -71,7 +71,12 @@ enum HuskLog {
         // Fresh file each launch. StikDebug relaunches us after attaching, so the
         // run that matters is always the most recent one; keeping the previous
         // run's noise would make the log harder to read, not easier.
+        // ...but the previous run is kept as husk-prev.log, because when a game took Husk down with it, that run's log is
+        // the crash report (CrashReport.swift).
         let url = logFileURL
+        let prev = url.deletingLastPathComponent().appendingPathComponent("husk-prev.log")
+        try? FileManager.default.removeItem(at: prev)
+        try? FileManager.default.moveItem(at: url, to: prev)
         logFD = open(url.path, O_CREAT | O_WRONLY | O_TRUNC, 0o644)
 
         redirectStdio()

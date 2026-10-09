@@ -13,6 +13,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ucontext.h>
@@ -21,6 +22,7 @@
 
 #include "husk-tl-audio.h"
 #include "husk-tl-cocos.h"
+#include "husk-tl-geode.h"
 #include "husk-tl-jni.h"
 #include "husk-tl-ld.h"
 
@@ -392,6 +394,14 @@ static void ec_bisect2(void)
     }
 }
 
+static void *start_thread(void *arg)
+{
+    pthread_setname_np("husk-native-start");
+    if (!tl_cocos_start(arg) || !tl_cocos_run()) { fprintf(stderr, "cocos: start failed\n"); return NULL; }
+    if (getenv("TL_START_THREAD_KEEP")) for (;;) pause();     /* what the app does now */
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) { fprintf(stderr, "usage: %s <apk> [seconds] [width height]\n", argv[0]); return 2; }
@@ -405,8 +415,9 @@ int main(int argc, char **argv)
 
     tl_ld_set_verbosity(getenv("TL_VERBOSE") ? atoi(getenv("TL_VERBOSE")) : 1);
     tl_jni_set_trace(getenv("TL_JNI_TRACE") ? atoi(getenv("TL_JNI_TRACE")) : 1);
-    char tmp[] = "/tmp/husk-cocos-XXXXXX";
-    mkdtemp(tmp);
+    char tmp[600] = "/tmp/husk-cocos-XXXXXX";
+    if (getenv("TL_DATA")) { snprintf(tmp, sizeof(tmp), "%s", getenv("TL_DATA")); mkdir(tmp, 0755); }   /* kept between runs */
+    else mkdtemp(tmp);
     const char *cef = "/Users/davi/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS/Frameworks/Chromium Embedded Framework.framework/Versions/A/Libraries";
     char egl[600], gles[600]; snprintf(egl, sizeof(egl), "%s/libEGL.dylib", cef); snprintf(gles, sizeof(gles), "%s/libGLESv2.dylib", cef);
     char frames[] = "/tmp/husk-cframes-XXXXXX"; mkdtemp(frames);
@@ -419,8 +430,26 @@ int main(int argc, char **argv)
     tl_cocos_text_install();
     if (getenv("TL_AUDIO_STATS")) tl_cocos_audio_hook = stats_hook;
     if (getenv("TL_AUDIO")) tl_audio_install();            /* off by default: a test run should not play through the speakers */
-    if (!tl_cocos_start(&cfg)) { fprintf(stderr, "cocos: start failed\n"); return 1; }
-    if (!tl_cocos_run()) { fprintf(stderr, "cocos: run failed\n"); return 1; }
+    /* TL_GEODE=<Geode.android64.so> [TL_GEODE_LAUNCHER=<geode launcher apk>]: load Geode into the game, as its launcher does. */
+    if (getenv("TL_GEODE_RESOURCES")) {                    /* Geode's own resources, where its launcher unpacks them */
+        char cmd[2400];
+        snprintf(cmd, sizeof(cmd), "mkdir -p '%s/geode/game/geode/resources/geode.loader' && cp -R '%s'/. '%s/geode/game/geode/resources/geode.loader/'",
+                 tmp, getenv("TL_GEODE_RESOURCES"), tmp);
+        if (system(cmd)) fprintf(stderr, "geode: could not copy the resources\n");
+    }
+    if (getenv("TL_GEODE")) tl_geode_configure(getenv("TL_GEODE"), getenv("TL_GEODE_LAUNCHER"), cfg.data_dir, getenv("TL_GD_VERSION") ? atoi(getenv("TL_GD_VERSION")) : 40);
+    /* TL_START_THREAD=1: start the game on a thread that ends once it has, as the app's launch thread did before it was kept
+     * (a Geode 5 crash: thread-local cleanup on that thread's exit). */
+    if (getenv("TL_START_THREAD")) {
+        static tl_cocos_config c2; c2 = cfg;
+        pthread_t st;
+        pthread_create(&st, NULL, start_thread, &c2);
+        if (getenv("TL_START_THREAD_KEEP")) pthread_detach(st);
+        else { pthread_join(st, NULL); fprintf(stderr, "cocos: the start thread has ended\n"); }
+    } else {
+        if (!tl_cocos_start(&cfg)) { fprintf(stderr, "cocos: start failed\n"); return 1; }
+        if (!tl_cocos_run()) { fprintf(stderr, "cocos: run failed\n"); return 1; }
+    }
     if (getenv("TL_SSL_PROBE")) install_ssl_probes();
     if (getenv("TL_CRYPTO_TEST")) crypto_selftest();
     if (getenv("TL_BN_TEST")) bn_selftest();

@@ -2,12 +2,10 @@ name: Husk
 options:
   bundleIdPrefix: com.husk
   deploymentTarget:
-    # 16.4, matching every IPA shipped so far and the -target iOS 16.0 the
-    # dylib is built with. project.yml said 17.0 while the checked-in .pbxproj
-    # said 16.4, and since nothing regenerated the project it was the .pbxproj
-    # that shipped. Regenerating it would otherwise have raised the floor for
-    # everyone as a side effect of adding one source file.
-    iOS: "16.4"
+    # 16.0: the lowest the app builds at as written (its SwiftUI is iOS 16), so
+    # it installs on the iOS 16 versions TrollStore runs on. QEMU, ANGLE and
+    # rppairing are built for 15.5, below it.
+    iOS: "16.0"
   createIntermediateGroups: true
 
 settings:
@@ -52,6 +50,8 @@ targets:
           - "husk-tl-unity-app.h"
       # The messages the app and its JIT helper exchange.
       - path: HuskJITHelper/HuskJITMessages.swift
+      # The download Live Activity's attributes, shared with the widget that draws it.
+      - path: Shared
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(HUSK_BUNDLE_IDENTIFIER)
@@ -74,18 +74,21 @@ targets:
         LD_RUNPATH_SEARCH_PATHS:
           - "$(inherited)"
           - "@executable_path/Frameworks"
-        # Husk targets recent iPhones only; a real Android guest needs the RAM.
-        TARGETED_DEVICE_FAMILY: "1"
+        # Husk targets iPhones and iPads (iPadOS).
+        TARGETED_DEVICE_FAMILY: "1,2"
         # XcodeGen links the dylib by -l, so the linker needs a library search
         # path (not just the framework search path it infers from the file).
         LIBRARY_SEARCH_PATHS:
           - "$(inherited)"
           - "$(SRCROOT)/../../build/ios-arm64/lib"
+          - "$(SRCROOT)/Frameworks"
         # zlib, for the translation layer's APK reader. Part of the iOS SDK. AudioToolbox is the sound a
         # cocos2d-x game's mixer plays through; CoreText and CoreGraphics draw its text labels.
         OTHER_LDFLAGS:
           - "$(inherited)"
           - "-lz"
+          # libresolv: the phone's DNS servers, for games that resolve names themselves (Geode's c-ares).
+          - "-lresolv"
           - "-framework"
           - "AudioToolbox"
           - "-framework"
@@ -100,8 +103,15 @@ targets:
     dependencies:
       # Built-in StikJIT's debugger process. Embedded into PlugIns/.
       - target: HuskJITHelper
+      # The download Live Activity (Lock Screen and Dynamic Island). Embedded into PlugIns/.
+      - target: HuskDownloadsWidget
       # Built by scripts/build_ios.sh. Embedded and signed into the bundle.
       - framework: ../../build/ios-arm64/lib/libqemu-aarch64-softmmu.dylib
+        embed: true
+        codeSign: true
+      # The file picker's Open button does nothing on certificate-signed installs; this tweak (from issue #60) hooks
+      # UIDocumentPickerViewController so the picker hands over copies. Linked so it loads at launch.
+      - framework: Frameworks/libFilePickerFix.dylib
         embed: true
         codeSign: true
       # ANGLE, which the QEMU dylib dlopens by @rpath at GL start-up. Embedded
@@ -227,7 +237,7 @@ targets:
         GENERATE_INFOPLIST_FILE: NO
         APPLICATION_EXTENSION_API_ONLY: YES
         CODE_SIGN_STYLE: Automatic
-        TARGETED_DEVICE_FAMILY: "1"
+        TARGETED_DEVICE_FAMILY: "1,2"
         # StikJIT.framework, in the app's Frameworks (the app target's Embed StikJIT).
         LD_RUNPATH_SEARCH_PATHS:
           - "$(inherited)"
@@ -238,3 +248,20 @@ targets:
       # here and embedded by the app target's Embed StikJIT.
       - framework: Frameworks/StikJIT.xcframework
         embed: false
+
+  # Draws the Live Activity a download shows (Downloads.swift starts and updates it). Live Activities are iOS 16.1.
+  HuskDownloadsWidget:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "16.1"
+    sources:
+      - path: HuskDownloadsWidget
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(HUSK_BUNDLE_IDENTIFIER).Downloads
+        INFOPLIST_FILE: HuskDownloadsWidget/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        APPLICATION_EXTENSION_API_ONLY: YES
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1"

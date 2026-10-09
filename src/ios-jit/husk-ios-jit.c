@@ -280,6 +280,150 @@ static bool husk_jit_selftest(const HuskDualMapping *m)
     return true;
 }
 
+
+/* ------------------------------------------------------------ self-granted */
+/*
+ * Executable memory without a trap servicer, before iOS 26 (no TXM). This is how TrollStore and jailbreaks give an app JIT:
+ *
+ *   - TrollStore keeps the entitlements an app is signed with, so Husk's dynamic-codesigning is honoured and a MAP_JIT mapping
+ *     executes with no debugger at all. TrollStore's own enable-jit (RootHelper/jit.m: ptrace(PT_ATTACHEXC), 100 ms, PT_DETACH)
+ *     additionally leaves CS_DEBUGGED set.
+ *   - Dopamine allows invalid pages in every app it launches (launchdhook's systemwide checkin calls cs_allow_invalid), but its
+ *     csops hook hides CS_DEBUGGED from the app unless "Allow JIT in Apps" is on. MAP_JIT is refused there (no entitlement), so it
+ *     needs plain memory made executable.
+ *   - A debugger that attached and let go (TrollStore, AltJIT, SideJITServer, StikDebug on an older iOS) leaves CS_DEBUGGED set,
+ *     which allows the same.
+ *
+ * Both routes give QEMU and the native runtime the same shape StikDebug's region has: an executable view and a writable alias of
+ * the same pages, side by side (the native loader reaches one from the other with adrp). The plain route is only tried where the
+ * kernel is known to allow unsigned pages, because executing one where it is not is a code-signing kill, not a signal. Every
+ * route is proven by calling a function written through the alias, under a fault guard.
+ */
+/* csops straight to the kernel: Dopamine hooks the libc function to hide CS_DEBUGGED (systemhook's csops_hook). */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static bool husk_kernel_debugged(void)
+{
+    uint32_t flags = 0;
+    return syscall(169 /* SYS_csops */, getpid(), 0 /* CS_OPS_STATUS */, &flags, sizeof(flags)) == 0 && (flags & 0x10000000u);
+}
+#pragma clang diagnostic pop
+
+static bool husk_page_is_executable(void *p);
+
+static sigjmp_buf g_self_jump;
+static volatile sig_atomic_t g_self_running;
+
+static void husk_self_fault(int sig)
+{
+    if (g_self_running) siglongjmp(g_self_jump, 1);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static bool husk_self_selftest(uint8_t *rx, uint8_t *rw)
+{
+    /* movz w0, #0x5a5a ; ret */
+    static const uint32_t code[2] = { 0x528B4B40u, 0xD65F03C0u };
+    if (!husk_page_is_executable(rx)) return false;
+    struct sigaction sa, ob, os, oi;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = husk_self_fault;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGBUS, &sa, &ob); sigaction(SIGSEGV, &sa, &os); sigaction(SIGILL, &sa, &oi);
+    bool ok = false;
+    g_self_running = 1;
+    if (sigsetjmp(g_self_jump, 1) == 0) {
+        memcpy(rw, code, sizeof(code));
+        sys_icache_invalidate(rx, sizeof(code));
+        ok = ((int (*)(void))(void *)rx)() == 0x5a5a;
+    }
+    g_self_running = 0;
+    sigaction(SIGBUS, &ob, NULL); sigaction(SIGSEGV, &os, NULL); sigaction(SIGILL, &oi, NULL);
+    return ok;
+}
+
+/* A writable alias of [rx, rx + size), placed right after it if possible and within 2 GiB either way. */
+static uint8_t *husk_rw_alias(uint8_t *rx, size_t size, bool fixed)
+{
+    vm_address_t alias = (vm_address_t)(rx + size);
+    vm_prot_t cur, max;
+    kern_return_t kr = vm_remap(mach_task_self(), &alias, size, 0,
+                                fixed ? (VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) : VM_FLAGS_ANYWHERE,
+                                mach_task_self(), (vm_address_t)rx, FALSE, &cur, &max, VM_INHERIT_NONE);
+    if (kr != KERN_SUCCESS) {
+        HUSK_LOG("self: vm_remap failed: %d (%s)", (int)kr, mach_error_string(kr));
+        return NULL;
+    }
+    long long dist = (long long)alias - (long long)(uintptr_t)rx;
+    if (dist > (2LL << 30) || dist < -(2LL << 30) ||
+        vm_protect(mach_task_self(), alias, size, FALSE, VM_PROT_READ | VM_PROT_WRITE) != KERN_SUCCESS) {
+        HUSK_LOG("self: writable alias unusable (distance %lld)", dist);
+        vm_deallocate(mach_task_self(), alias, size);
+        return NULL;
+    }
+    return (uint8_t *)alias;
+}
+
+/* How the held region was made, for Settings: NULL until it is, then "MAP_JIT" or "plain". */
+static const char *volatile g_self_route;
+
+const char *husk_ios_jit_self_route(void) { return g_self_route; }
+
+static HuskDualMapping husk_self_dual_mapping(size_t bytes)
+{
+    HuskDualMapping none = { NULL, NULL, 0 };
+    if (__builtin_available(iOS 26.0, *)) {
+        HUSK_LOG("self: iOS 26 enforces TXM; only a debugger can grant executable memory here");
+        return none;
+    }
+    size_t size = (bytes + 0x3fff) & ~(size_t)0x3fff;
+
+    /* 1. MAP_JIT, honoured where dynamic-codesigning is (TrollStore). Refused with EPERM elsewhere, harmlessly. */
+    uint8_t *rx = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+    if (rx == MAP_FAILED) {
+        HUSK_LOG("self: MAP_JIT refused (%s)", strerror(errno));
+    } else {
+        uint8_t *rw = husk_rw_alias(rx, size, false);
+        if (rw && husk_self_selftest(rx, rw)) {
+            HuskDualMapping m = { rw, rx, size };
+            atomic_store(&g_jit_available, true);
+            g_self_route = "MAP_JIT";
+            HUSK_LOG("self: PASS -- %zu MiB from MAP_JIT (dynamic-codesigning), rx=%p rw=%p", size >> 20, (void *)rx, (void *)rw);
+            return m;
+        }
+        HUSK_LOG("self: MAP_JIT region did not pass its test");
+        if (rw) vm_deallocate(mach_task_self(), (vm_address_t)rw, size);
+        munmap(rx, size);
+    }
+
+    /* 2. Plain memory made executable: only where invalid pages are known to be allowed. */
+    bool debugged = husk_kernel_debugged();
+    bool jailbroken = access("/var/jb", F_OK) == 0;
+    if (!debugged && !jailbroken) {
+        HUSK_LOG("self: not marked as debugged and not jailbroken; nothing else is safe to try");
+        return none;
+    }
+    uint8_t *base = mmap(NULL, size * 2, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (base == MAP_FAILED) {
+        HUSK_LOG("self: could not reserve %zu MiB: %s", (size * 2) >> 20, strerror(errno));
+        return none;
+    }
+    rx = mmap(base, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0);
+    uint8_t *rw = rx == MAP_FAILED ? NULL : husk_rw_alias(rx, size, true);
+    if (rw && vm_protect(mach_task_self(), (vm_address_t)rx, size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE) == KERN_SUCCESS && husk_self_selftest(rx, rw)) {
+        HuskDualMapping m = { rw, rx, size };
+        atomic_store(&g_jit_available, true);
+        g_self_route = "plain";
+        HUSK_LOG("self: PASS -- %zu MiB of plain memory (%s), rx=%p rw=%p", size >> 20,
+                 debugged ? "process is debugged" : "jailbreak allows invalid pages", (void *)rx, (void *)rw);
+        return m;
+    }
+    HUSK_LOG("self: plain memory did not execute (%s)", debugged ? "debugged" : "jailbroken");
+    munmap(base, size * 2);
+    return none;
+}
+
 /* ------------------------------------------------------------- allocation */
 
 /*
@@ -312,6 +456,12 @@ HUSK_EXPORT bool husk_ios_jit_prewarm(size_t bytes)
     fprintf(stderr, "[husk-jit] prewarm %s: %zu bytes\n",
             husk_prewarmed.rw_addr ? "OK" : "FAILED", bytes);
     return husk_prewarmed.rw_addr != NULL;
+}
+
+/* The held region, for the native runtime (translation-layer/husk-tl-load.c looks this up by name). */
+HUSK_EXPORT HuskDualMapping *husk_ios_jit_get_mapping(void)
+{
+    return husk_prewarmed.rw_addr ? &husk_prewarmed : NULL;
 }
 
 HuskDualMapping husk_ios_jit_allocate(size_t bytes)
@@ -356,9 +506,9 @@ static HuskDualMapping husk_ios_jit_allocate_real(size_t bytes)
     if (probe == 0) {
         HUSK_LOG("#%llu: StikDebug is NOT servicing traps -- probe returned 0, which "
                  "is our own SIGTRAP handler stepping over an unanswered brk. "
-                 "Cannot allocate %zu bytes.",
+                 "Trying to make %zu bytes without it.",
                  (unsigned long long)n, bytes);
-        return region;
+        return husk_self_dual_mapping(bytes);
     }
 
     uint32_t probe_lo = (uint32_t)probe;
@@ -640,6 +790,7 @@ void husk_ios_jit_release(HuskDualMapping *m) { (void)m; }
 void husk_ios_jit_detach(void) {}
 bool husk_ios_jit_is_available(void) { return false; }
 bool husk_ios_jit_mapjit_works(void) { return false; }
+const char *husk_ios_jit_self_route(void) { return 0; }
 void husk_ios_jit_log_footprint(const char *tag) { (void)tag; }
 size_t husk_ios_available_memory(void) { return 0; }
 

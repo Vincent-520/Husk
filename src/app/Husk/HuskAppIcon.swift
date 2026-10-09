@@ -90,35 +90,13 @@ enum HuskAppIcon: String, CaseIterable, Identifiable {
 }
 
 
-/// The two tabs.
-///
-/// Android and the console used to be tabs of their own. Android is not one any
-/// more because the guest has to stay mounted whatever is on screen, and the
-/// console moved into Diagnostics -- it is something you go looking for, not a
-/// quarter of the app's navigation.
+/// The three tabs: Home (what you used last), the Library (everything) and Settings.
 enum HuskTab: String, CaseIterable, Identifiable {
-    case translation
+    case home
     case library
-    case files
+    case store
+    case downloads
     case settings
 
     var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .translation: return "Native"
-        case .library:  return "Library"
-        case .files:    return "Files"
-        case .settings: return "Settings"
-        }
-    }
-
-    var icon: String {
-        switch self {
-        case .translation: return "gamecontroller.fill"
-        case .library:  return "square.grid.2x2.fill"
-        case .files:    return "folder.fill"
-        case .settings: return "gearshape.fill"
-        }
-    }
 }

@@ -29,10 +29,24 @@ final class TLScreenUIView: UIView {
     private var statsSince = CACurrentMediaTime()
     private var statsTimer: Timer?
 
+    /// Three fingers tapped at once: the way back to the interface while it is hidden.
+    var onThreeFingerTap: (() -> Void)?
+    /// The frame-rate readout in the corner.
+    var showsStats = true { didSet { stats.isHidden = !showsStats } }
+    /// The one finger the game is following; a second or third finger is only for the three-finger tap.
+    private var primary: UITouch?
+
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .black
-        isMultipleTouchEnabled = false
+        // Several fingers reach the view so a three-finger tap can be seen; the game itself only ever gets the first.
+        isMultipleTouchEnabled = true
+        let three = UITapGestureRecognizer(target: self, action: #selector(threeFingers))
+        three.numberOfTouchesRequired = 3
+        three.cancelsTouchesInView = false
+        three.delaysTouchesBegan = false
+        three.delaysTouchesEnded = false
+        addGestureRecognizer(three)
 
         // Opaque, so Core Animation does not blend it with what is behind it.
         content.isOpaque = true
@@ -167,19 +181,41 @@ final class TLScreenUIView: UIView {
     /// it moves, up once. The earlier gesture sent DOWN on every change and never
     /// a move, so a finger that wobbled while tapping delivered several downs --
     /// and in a game where a down is a flap, several flaps from one tap.
-    private func send(_ touches: Set<UITouch>, action: Int32) {
-        guard let t = touches.first else { return }
+    private func send(_ t: UITouch, action: Int32) {
         let (x, y) = guest(t.location(in: self))
         husk_tl_send_touch(action, x, y)
     }
 
-    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?)     { send(touches, action: 0) }
-    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?)     { send(touches, action: 2) }
-    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?)     { send(touches, action: 1) }
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) { send(touches, action: 3) }
+    @objc private func threeFingers() { onThreeFingerTap?() }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard primary == nil, let t = touches.first else { return }
+        primary = t
+        send(t, action: 0)
+    }
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if let p = primary, touches.contains(p) { send(p, action: 2) }
+    }
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if let p = primary, touches.contains(p) { send(p, action: 1); primary = nil }
+    }
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if let p = primary, touches.contains(p) { send(p, action: 3); primary = nil }
+    }
 }
 
 struct TLScreenView: UIViewRepresentable {
-    func makeUIView(context: Context) -> TLScreenUIView { TLScreenUIView() }
-    func updateUIView(_ view: TLScreenUIView, context: Context) {}
+    var showsStats = true
+    var onThreeFingerTap: (() -> Void)? = nil
+
+    func makeUIView(context: Context) -> TLScreenUIView {
+        let view = TLScreenUIView()
+        view.showsStats = showsStats
+        view.onThreeFingerTap = onThreeFingerTap
+        return view
+    }
+    func updateUIView(_ view: TLScreenUIView, context: Context) {
+        view.showsStats = showsStats
+        view.onThreeFingerTap = onThreeFingerTap
+    }
 }

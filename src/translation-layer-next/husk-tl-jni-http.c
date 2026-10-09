@@ -17,6 +17,9 @@
 
 #include "husk-tl-bionic.h"
 #include "husk-tl-http.h"
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <resolv.h>
 
 static jvalue vl(void *p) { jvalue v; v.j = 0; v.l = p; return v; }
 static jvalue vi(int i) { jvalue v; v.j = 0; v.i = i; return v; }
@@ -189,6 +192,53 @@ static void NI_type(tl_jcall *c) { c->ret = vi(1); }                          /*
 static void NI_typeName(tl_jcall *c) { c->ret = vl(tl_jni_new_string("WIFI")); }
 static void NI_subtype(tl_jcall *c) { c->ret = vi(0); }
 
+/*
+ * The DNS servers the phone uses, as text, for code that resolves names itself rather than through getaddrinfo: c-ares (in
+ * Geode 5's curl, and others) asks Android for them through ConnectivityManager -> LinkProperties.getDnsServers(), and
+ * failing that reads net.dns1/net.dns2. Without an answer it has no servers and every request fails with "couldn't resolve
+ * host". The system's own resolver configuration is read once; public resolvers stand behind it.
+ */
+int tl_dns_servers(char out[][64], int max)
+{
+    int n = 0;
+    struct __res_state st;
+    memset(&st, 0, sizeof(st));
+    if (res_ninit(&st) == 0) {
+        union res_sockaddr_union addrs[8];
+        int got = res_getservers(&st, addrs, 8);
+        for (int i = 0; i < got && n < max; i++) {
+            if (addrs[i].sin.sin_family == AF_INET) inet_ntop(AF_INET, &addrs[i].sin.sin_addr, out[n], 64);
+            else if (addrs[i].sin6.sin6_family == AF_INET6) inet_ntop(AF_INET6, &addrs[i].sin6.sin6_addr, out[n], 64);
+            else continue;
+            if (out[n][0]) n++;
+        }
+        res_ndestroy(&st);
+    }
+    static const char *fallback[] = { "1.1.1.1", "8.8.8.8" };
+    for (int i = 0; i < 2 && n < max; i++) snprintf(out[n++], 64, "%s", fallback[i]);
+    return n;
+}
+
+static void CM_linkProperties(tl_jcall *c) { c->ret = vl(tl_jni_new_object(tl_jni_class("android/net/LinkProperties"))); }
+typedef struct { jobj **items; uint32_t n; } alist;      /* the ArrayList the gamepad code answers size()/get() for */
+static void LP_dnsServers(tl_jcall *c)
+{
+    char servers[6][64];
+    int n = tl_dns_servers(servers, 6);
+    jobj *l = tl_jni_new_object(tl_jni_class("java/util/ArrayList"));
+    alist *a = calloc(1, sizeof(*a));
+    a->items = calloc((size_t)n, sizeof(jobj *));
+    for (int i = 0; i < n; i++) {
+        jobj *ia = tl_jni_new_object(tl_jni_class("java/net/InetAddress"));
+        jvalue v; v.j = 0; v.l = tl_jni_new_string(servers[i]);
+        tl_jni_set_field(ia, "host", "Ljava/lang/String;", v);
+        a->items[a->n++] = ia;
+    }
+    l->native = a;
+    c->ret = vl(l);
+}
+static void IA_hostAddress(tl_jcall *c) { c->ret = tl_jni_get_field(c->self, "host", "Ljava/lang/String;"); }
+
 /* The phone has its network, as far as a game asking Android about it can tell: one active connection, over Wi-Fi, that is up. */
 static const tl_jhle k_net[] = {
     M_("android/net/ConnectivityManager", "getActiveNetworkInfo", "()Landroid/net/NetworkInfo;", CM_activeNetworkInfo),
@@ -199,6 +249,9 @@ static const tl_jhle k_net[] = {
     M_("android/net/NetworkInfo", "isAvailable", "()Z", True_), M_("android/net/NetworkInfo", "getType", "()I", NI_type),
     M_("android/net/NetworkInfo", "getTypeName", "()Ljava/lang/String;", NI_typeName), M_("android/net/NetworkInfo", "getSubtype", "()I", NI_subtype),
     M_("android/net/NetworkCapabilities", "hasCapability", "(I)Z", True_), M_("android/net/NetworkCapabilities", "hasTransport", "(I)Z", True_),
+    M_("android/net/ConnectivityManager", "getLinkProperties", "(Landroid/net/Network;)Landroid/net/LinkProperties;", CM_linkProperties),
+    M_("android/net/LinkProperties", "getDnsServers", "()Ljava/util/List;", LP_dnsServers),
+    M_("java/net/InetAddress", "getHostAddress", "()Ljava/lang/String;", IA_hostAddress),
     { NULL, NULL, NULL, NULL }
 };
 
@@ -344,6 +397,7 @@ static const tl_jhle k_xbox[] = {
 void tl_http_install(void)
 {
     tl_jni_declare("android/net/NetworkInfo", "java/lang/Object"); tl_jni_declare("android/net/Network", "java/lang/Object");
+    tl_jni_declare("android/net/LinkProperties", "java/lang/Object"); tl_jni_declare("java/net/InetAddress", "java/lang/Object");
     tl_jni_declare("android/net/NetworkCapabilities", "java/lang/Object");
     tl_jni_register_hle(k_net);
     tl_jni_declare("com/xbox/httpclient/HttpClientRequest", "java/lang/Object"); tl_jni_declare("com/xbox/httpclient/HttpClientResponse", "java/lang/Object");

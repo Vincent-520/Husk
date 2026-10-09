@@ -135,6 +135,9 @@ static void *control_thread(void *arg)
                 unsigned btn = 0; tl_pad_state st = { 0 };
                 if (sscanf(line + 4, "%x %f %f %f %f %f %f", &btn, &st.lx, &st.ly, &st.rx, &st.ry, &st.lt, &st.rt) >= 1) { st.buttons = btn; tl_pad_update(0, &st); }
             }
+            else if (!strncmp(line, "type ", 5)) { line[strcspn(line, "\n")] = 0; tl_ga_insert_text(line + 5); }
+            else if (!strncmp(line, "bksp", 4)) tl_ga_delete_backward();
+            else if (!strncmp(line, "enter", 5)) tl_ga_editor_action();
             else if (!strncmp(line, "pause", 5)) tl_ga_set_paused(true);
             else if (!strncmp(line, "resume", 6)) tl_ga_set_paused(false);
             else if (!strncmp(line, "quit", 4)) { fprintf(stderr, "ctl: quit\n"); fflush(stderr); _exit(0); }
@@ -316,6 +319,8 @@ static void *profiler(void *arg)
     return NULL;
 }
 
+static void keyboard_hook(int action) { fprintf(stderr, "ctl: the game %s the keyboard\n", action == 1 ? "shows" : "hides"); }
+
 int main(int argc, char **argv)
 {
     if (argc < 2) { fprintf(stderr, "usage: %s <apk> [seconds] [width height]\n", argv[0]); return 2; }
@@ -342,6 +347,7 @@ int main(int argc, char **argv)
     g_frame_dir = frames;
     if (getenv("TL_AUDIO")) tl_audio_install();
     if (getenv("TL_PAD")) tl_pad_connect(0, "Xbox Wireless Controller");
+    tl_ga_set_keyboard_handler(keyboard_hook);
     if (!tl_ga_start(&cfg)) { fprintf(stderr, "minecraft: start failed\n"); return 1; }
     if (getenv("TL_MC_RAND_TEST")) {
         tl_lib *L = tl_ld_find_lib("libminecraftpe.so");

@@ -171,8 +171,17 @@ static int bionic___system_property_read(const void *pi, char *name, char *value
     return (int)strlen(p->v);
 }
 
+int tl_dns_servers(char out[][64], int max);
+
 static int bionic___system_property_get(const char *name, char *value)
 {
+    /* net.dns1, net.dns2: the phone's DNS servers (see tl_dns_servers) */
+    if (name && value && !strncmp(name, "net.dns", 7) && name[7] >= '1' && name[7] <= '4' && !name[8]) {
+        char servers[4][64];
+        int n = tl_dns_servers(servers, 4), i = name[7] - '1';
+        snprintf(value, 92, "%s", i < n ? servers[i] : "");
+        return (int)strlen(value);
+    }
     const char *v = name ? tl_sysprop(name) : NULL;
     if (!value) return 0;
     if (!v) { value[0] = 0; return 0; }
@@ -497,17 +506,25 @@ static void dl_fail(const char *fmt, const char *arg)
 
 static void *bionic_dlopen(const char *path, int flags)
 {
-    (void)flags;
     if (!path) return &g_sys_handle[0];          /* the global namespace */
     const char *base = strrchr(path, '/');
     base = base ? base + 1 : path;
+    /* RTLD_NOLOAD (bionic: 4): only one already loaded. Geode finds the game this way. */
+    if (flags & 4) {
+        tl_lib *L = tl_ld_find_lib(base);
+        if (getenv("TL_DL_TRACE")) tl_log_line("dl: dlopen(%s, NOLOAD) -> %s", path, L ? "loaded" : "not loaded");
+        if (!L) dl_fail("dlopen failed: library \"%s\" is not loaded", path);
+        return L;
+    }
     if (!strcmp(base, "libvulkan.so") && !tl_vk_available()) { dl_fail("dlopen failed: library \"%s\" not found", path); return NULL; }
     if (tl_bionic_is_system_lib(base)) {
         for (int i = 0; i < g_nsys; i++) if (!strcmp(g_sys_names[i], base)) return &g_sys_handle[i + 1];
         if (g_nsys < 15) { snprintf(g_sys_names[g_nsys], 48, "%s", base); g_nsys++; return &g_sys_handle[g_nsys]; }
         return &g_sys_handle[0];
     }
-    tl_lib *L = tl_ld_load(base);
+    /* A path to a file of its own (a mod's library) loads from there; a bare name, or a path into the app, from the APK. */
+    tl_lib *L = tl_ld_find_lib(base);
+    if (!L) L = tl_ld_load(path[0] == '/' ? path : base);
     if (getenv("TL_DL_TRACE")) tl_log_line("dl: dlopen(%s) -> %s", path, L ? "ok" : "not found");
     if (!L) { dl_fail("dlopen failed: library \"%s\" not found", path); return NULL; }
     tl_ld_init(L);
@@ -547,7 +564,8 @@ static int bionic_dladdr(const void *addr, guest_dl_info *info)
     const char *sym = tl_ld_symbol_at(addr, &ln, &sa);
     if (!ln) return 0;
     info->dli_fname = ln;
-    info->dli_fbase = (void *)tl_ld_sym(NULL, "__ehdr_start");
+    /* The base of the library the address is in: Geode computes every hook address from the game's. */
+    info->dli_fbase = tl_ld_lib_base(tl_ld_lib_of(addr));
     info->dli_sname = sym;
     info->dli_saddr = (void *)sa;
     return 1;
@@ -591,7 +609,7 @@ const tl_bionic_entry tl_tab_core[] = {
     TL_WRAP("closelog", bionic_closelog),
     TL_WRAP("abort", bionic_abort),
     TL_WRAP("exit", bionic_exit),
-    TL_DIRECT(_exit),
+    TL_DIRECT(_exit), TL_DIRECT(_Exit),
     TL_WRAP("__stack_chk_fail", bionic___stack_chk_fail),
     TL_WRAP("__assert2", bionic___assert2),
     TL_WRAP("android_set_abort_message", bionic_android_set_abort_message),

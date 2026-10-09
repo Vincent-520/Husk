@@ -291,6 +291,155 @@ void tl_ga_touch(int phase, int id, float x, float y)
     tl_ga_post(touch_run, t);
 }
 
+/* -------------------------------------------------------------- keyboard */
+
+/*
+ * GameTextInput, the text side of GameActivity (Minecraft's chat, sign and world-name fields). On Android the IME edits a
+ * copy of the field and hands the whole of it back -- text, selection, composing region -- through onTextInputEventNative.
+ * Here the iPhone's keyboard does the IME's part: the game's field is kept from setTextInputState, each key edits it, and
+ * the new state goes back the same way. Indices are UTF-16 code units, as Java's are.
+ */
+static struct {
+    pthread_mutex_t lock;
+    uint16_t text[4096];
+    int len, sel_start, sel_end;
+    int action;                      /* the IME action Return performs (EditorInfo.imeOptions & IME_MASK_ACTION) */
+    void (*hook)(int action);        /* the app: 1 = show the keyboard, 2 = hide it */
+} K = { PTHREAD_MUTEX_INITIALIZER, {0}, 0, 0, 0, 6, NULL };
+
+void tl_ga_set_keyboard_handler(void (*hook)(int action)) { K.hook = hook; }
+
+static int utf8_to_utf16(const char *s, uint16_t *out, int cap)
+{
+    int n = 0;
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p && n < cap) {
+        uint32_t c; int extra;
+        if (*p < 0x80) { c = *p; extra = 0; }
+        else if ((*p & 0xE0) == 0xC0) { c = *p & 0x1F; extra = 1; }
+        else if ((*p & 0xF0) == 0xE0) { c = *p & 0x0F; extra = 2; }
+        else { c = *p & 0x07; extra = 3; }
+        p++;
+        for (int i = 0; i < extra && (*p & 0xC0) == 0x80; i++, p++) c = (c << 6) | (*p & 0x3F);
+        if (c >= 0x10000) { if (n + 1 >= cap) break; c -= 0x10000; out[n++] = (uint16_t)(0xD800 | (c >> 10)); out[n++] = (uint16_t)(0xDC00 | (c & 0x3FF)); }
+        else out[n++] = (uint16_t)c;
+    }
+    return n;
+}
+
+static void utf16_to_utf8(const uint16_t *s, int n, char *out, size_t cap)
+{
+    size_t o = 0;
+    for (int i = 0; i < n && o + 5 < cap; i++) {
+        uint32_t c = s[i];
+        if (c >= 0xD800 && c < 0xDC00 && i + 1 < n) { c = 0x10000 + ((c - 0xD800) << 10) + (s[i + 1] - 0xDC00); i++; }
+        if (c < 0x80) out[o++] = (char)c;
+        else if (c < 0x800) { out[o++] = (char)(0xC0 | (c >> 6)); out[o++] = (char)(0x80 | (c & 0x3F)); }
+        else if (c < 0x10000) { out[o++] = (char)(0xE0 | (c >> 12)); out[o++] = (char)(0x80 | ((c >> 6) & 0x3F)); out[o++] = (char)(0x80 | (c & 0x3F)); }
+        else { out[o++] = (char)(0xF0 | (c >> 18)); out[o++] = (char)(0x80 | ((c >> 12) & 0x3F)); out[o++] = (char)(0x80 | ((c >> 6) & 0x3F)); out[o++] = (char)(0x80 | (c & 0x3F)); }
+    }
+    out[o] = 0;
+}
+
+/* The game says what its field holds now (GameActivity.setTextInputState / InputConnection.setState). */
+void tl_ga_text_state(const char *utf8, int sel_start, int sel_end)
+{
+    pthread_mutex_lock(&K.lock);
+    K.len = utf8 ? utf8_to_utf16(utf8, K.text, 4096) : 0;
+    K.sel_start = sel_start < 0 || sel_start > K.len ? K.len : sel_start;
+    K.sel_end = sel_end < K.sel_start || sel_end > K.len ? K.sel_start : sel_end;
+    pthread_mutex_unlock(&K.lock);
+}
+
+void tl_ga_keyboard(bool show) { if (K.hook) K.hook(show ? 1 : 2); }
+
+void tl_ga_text_copy(char *out, size_t cap)
+{
+    pthread_mutex_lock(&K.lock);
+    utf16_to_utf8(K.text, K.len, out, cap);
+    pthread_mutex_unlock(&K.lock);
+}
+void tl_ga_ime_options(int ime_options) { int a = ime_options & 0xFF; K.action = a ? a : 6; }
+
+typedef struct { char *text; int sel; int action; } text_job;
+
+static void text_run(void *arg)
+{
+    text_job *j = arg;
+    if (j->action) {
+        typedef void (*act_fn)(void *env, void *self, int64_t h, int32_t action);
+        act_fn fn = (act_fn)GA_NATIVE("onEditorActionNative", "(JI)V");
+        if (fn && G.handle) fn(tl_jni_env(), G.activity, G.handle, j->action);
+    } else {
+        typedef void (*text_fn)(void *env, void *self, int64_t h, void *state);
+        text_fn fn = (text_fn)GA_NATIVE("onTextInputEventNative", "(JLcom/google/androidgamesdk/gametextinput/State;)V");
+        if (fn && G.handle) {
+            jobj *st = tl_jni_new_object(tl_jni_class("com/google/androidgamesdk/gametextinput/State"));
+            jvalue v;
+            v.j = 0; v.l = tl_jni_new_string(j->text); tl_jni_set_field(st, "text", "Ljava/lang/String;", v);
+            v.j = 0; v.i = j->sel; tl_jni_set_field(st, "selectionStart", "I", v); tl_jni_set_field(st, "selectionEnd", "I", v);
+            v.j = 0; v.i = -1; tl_jni_set_field(st, "composingRegionStart", "I", v); tl_jni_set_field(st, "composingRegionEnd", "I", v);
+            fn(tl_jni_env(), G.activity, G.handle, st);
+            if (tl_jni_pending()) tl_jni_clear();
+        }
+    }
+    free(j->text);
+    free(j);
+}
+
+/* Send the field's state as it is now, from the game's UI thread. */
+static void send_state_locked(void)
+{
+    text_job *j = calloc(1, sizeof(*j));
+    j->text = malloc(4096 * 4 + 1);
+    utf16_to_utf8(K.text, K.len, j->text, 4096 * 4 + 1);
+    j->sel = K.sel_start;
+    tl_ga_post(text_run, j);
+}
+
+/* The keyboard typed this: it replaces the selection, and the caret goes after it. */
+void tl_ga_insert_text(const char *utf8)
+{
+    uint16_t add[512];
+    int n = utf8_to_utf16(utf8, add, 512);
+    pthread_mutex_lock(&K.lock);
+    int keep_after = K.len - K.sel_end;
+    if (K.sel_start + n + keep_after <= 4096) {
+        memmove(K.text + K.sel_start + n, K.text + K.sel_end, (size_t)keep_after * 2);
+        memcpy(K.text + K.sel_start, add, (size_t)n * 2);
+        K.len = K.sel_start + n + keep_after;
+        K.sel_start = K.sel_end = K.sel_start + n;
+        send_state_locked();
+    }
+    pthread_mutex_unlock(&K.lock);
+}
+
+/* Backspace: the selection, or the character before the caret (both halves of a surrogate pair). */
+void tl_ga_delete_backward(void)
+{
+    pthread_mutex_lock(&K.lock);
+    int from = K.sel_start, to = K.sel_end;
+    if (from == to && from > 0) {
+        from--;
+        if (from > 0 && K.text[from] >= 0xDC00 && K.text[from] < 0xE000 && K.text[from - 1] >= 0xD800 && K.text[from - 1] < 0xDC00) from--;
+    }
+    if (from != to) {
+        memmove(K.text + from, K.text + to, (size_t)(K.len - to) * 2);
+        K.len -= to - from;
+        K.sel_start = K.sel_end = from;
+        send_state_locked();
+    }
+    pthread_mutex_unlock(&K.lock);
+}
+
+/* Return: the field's IME action (send, done, go), as the game asked for it. */
+void tl_ga_editor_action(void)
+{
+    text_job *j = calloc(1, sizeof(*j));
+    j->action = K.action;
+    tl_ga_post(text_run, j);
+}
+
 /* ------------------------------------------------------------- controller */
 
 typedef struct { jobj *ev; bool down; } key_job;

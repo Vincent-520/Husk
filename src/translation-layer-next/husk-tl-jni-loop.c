@@ -237,6 +237,12 @@ static jobj *proxy_call(jobj *proxy, const char *iface, const char *name, const 
     return r;
 }
 
+/* For other parts of the runtime that hand a result back to a game's listener (Play services' Tasks, Billing). */
+jobj *tl_proxy_call(jobj *proxy, const char *iface, const char *name, const char *sig, jobj **args, int nargs)
+{
+    return proxy_call(proxy, iface, name, sig, args, nargs);
+}
+
 static void run_runnable(jobj *run)
 {
     if (!run) return;

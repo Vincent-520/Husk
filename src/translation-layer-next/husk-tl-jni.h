@@ -93,6 +93,7 @@ void  tl_jni_unref(jobj *o);
 /* Fields by name; created on first use. */
 void tl_jni_set_field(jobj *o, const char *name, const char *sig, jvalue v);
 jvalue tl_jni_get_field(jobj *o, const char *name, const char *sig);
+void tl_jni_set_static_field(const char *cls, const char *name, const char *sig, jvalue v);
 void tl_jni_set_static(const char *cls, const char *name, const char *sig, jvalue v);
 jvalue tl_jni_get_static(const char *cls, const char *name, const char *sig);
 

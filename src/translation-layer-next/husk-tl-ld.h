@@ -35,7 +35,11 @@ extern "C" {
 typedef struct tl_lib tl_lib;
 
 /* Where libraries come from: the APKs' lib/arm64-v8a/ directories. */
+#define TL_LD_MAX_APKS 8
 bool tl_ld_add_apk(const char *path);
+/* A split APK of the app about to start; added right after its base APK, whichever engine adds that. */
+void tl_ld_queue_split(const char *path);
+const char *tl_ld_queued_split(int index);              /* NULL past the last */
 
 /* The APKs added, in order, for asset access; NULL past the last. */
 struct tl_zip;
@@ -67,6 +71,7 @@ void *tl_ld_sym(tl_lib *lib, const char *name);
 
 /* The library an address belongs to (either view), and the nearest exported symbol. */
 tl_lib *tl_ld_lib_of(const void *addr);
+void *tl_ld_lib_base(const tl_lib *lib);
 const char *tl_ld_lib_name(const tl_lib *lib);
 const char *tl_ld_symbol_at(const void *addr, const char **lib_name, const void **sym_addr);
 

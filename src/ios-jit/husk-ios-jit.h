@@ -116,6 +116,12 @@ HUSK_EXPORT bool husk_ios_jit_is_available(void);
 HUSK_EXPORT bool husk_ios_jit_mapjit_works(void);
 
 /*
+ * When the region was made without a trap servicer (before iOS 26: TrollStore, a jailbreak, or a debugger that has let go),
+ * which way: "MAP_JIT" or "plain". NULL otherwise.
+ */
+HUSK_EXPORT const char *husk_ios_jit_self_route(void);
+
+/*
  * Log the process's phys_footprint -- the number jetsam actually kills on.
  * `tag` labels the call site in the log.
  */
